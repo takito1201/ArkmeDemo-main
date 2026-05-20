@@ -24,7 +24,7 @@
   
   v0.1.1
   
- - AI API 设置：我在设置内加入了api设置，支持配置 Base URL、API Key、Model，配置好api后可以成功调用ai
+ - AI API 设置：我在设置内加入了api设置，支持配置 Base URL、API Key、Model，配置好api后可以成功调用ai，后面的识别功能都是基于ai的调用实现的，如果不配置ai，无法正常使用。
 
   v0.1.2
 
