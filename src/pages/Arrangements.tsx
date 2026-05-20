@@ -1,4 +1,27 @@
 import React from "react";
+import {
+  addDays,
+  arrangementsStorageKey,
+  arrangementStorageEvent,
+  buildDateKey,
+  getInitialArrangements,
+  getPendingArrangementDrafts,
+  isValidDateKey,
+  isValidTimeValue,
+  pendingArrangementDraftsStorageKey,
+  persistArrangements,
+  removePendingArrangementDraft,
+  type ArrangementDraft,
+  type ArrangementItem,
+  type ArrangementStatus,
+  type ArrangementTimeKind,
+  type PendingArrangementDraft,
+} from "@/arrangements/arrangementStorage";
+import {
+  findSimilarArrangementsWithAi,
+  mergeSimilarArrangement,
+  type SimilarArrangementMatch,
+} from "@/arrangements/similarArrangements";
 import { cn } from "@/lib/utils";
 import { usePreferences } from "@/settings/preferences";
 
@@ -6,10 +29,8 @@ type ArrangementsProps = {
   onOpenMenu: () => void;
 };
 
-type ArrangementStatus = "pending" | "later" | "completed";
 type ArrangementView = "list" | "calendar";
 type ArrangementListSort = "created" | "time";
-type ArrangementTimeKind = "none" | "allDay" | "time" | "timeRange";
 
 type CompletionToast = {
   item: ArrangementItem;
@@ -21,56 +42,19 @@ type GentleReminderCandidate = {
   autoDismiss: boolean;
 };
 
-type ArrangementItem = {
-  id: string;
-  title: string;
-  timeText: string;
-  dateKey: string;
-  startTime: string;
-  endTime: string;
-  timeKind: ArrangementTimeKind;
-  peopleText: string;
-  locationText: string;
-  locationName: string;
-  note: string;
-  source: string;
-  status: ArrangementStatus;
-  createdAt: number;
-  pinned: boolean;
-};
-
-type ArrangementDraft = {
-  title: string;
-  timeText: string;
-  dateKey: string;
-  startTime: string;
-  endTime: string;
-  timeKind: ArrangementTimeKind;
-  peopleText: string;
-  locationText: string;
-  locationName: string;
-  note: string;
-};
-
 type ArrangementEditDraft = ArrangementDraft & {
   status: ArrangementStatus;
 };
 
-const arrangementsStorageKey = "arkme-demo.arrangements";
+type ArrangementMergeSuggestion = {
+  candidate: ArrangementItem;
+  matches: SimilarArrangementMatch[];
+  pendingDraftId?: string;
+  persistedCandidateId?: string;
+};
+
 const reminderDismissedStorageKey =
   "arkme-demo.arrangement-reminder-dismissed";
-const calendarDayMs = 24 * 60 * 60 * 1000;
-
-function buildDateKey(date: Date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function addDays(date: Date, days: number) {
-  return new Date(date.getTime() + days * calendarDayMs);
-}
 
 function parseDateKey(dateKey: string) {
   if (!isValidDateKey(dateKey)) return null;
@@ -80,25 +64,6 @@ function parseDateKey(dateKey: string) {
 
 function getTodayDateKey() {
   return buildDateKey(new Date());
-}
-
-function isValidDateKey(value: string) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value);
-}
-
-function isValidTimeValue(value: string) {
-  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
-}
-
-function normalizeTimeKind(value: unknown): ArrangementTimeKind {
-  return value === "allDay" || value === "time" || value === "timeRange"
-    ? value
-    : "none";
-}
-
-function normalizeArrangementStatus(value: unknown): ArrangementStatus {
-  if (value === "later" || value === "completed") return value;
-  return "pending";
 }
 
 function buildReminderDismissKey(item: ArrangementItem, dateKey: string) {
@@ -237,62 +202,6 @@ function sortArrangementsByTime(a: ArrangementItem, b: ArrangementItem) {
 }
 
 const todayDateKey = getTodayDateKey();
-const tomorrowDateKey = buildDateKey(addDays(new Date(), 1));
-const dayAfterTomorrowDateKey = buildDateKey(addDays(new Date(), 2));
-
-const defaultArrangements: ArrangementItem[] = [
-  {
-    id: "sample-hospital",
-    title: "后天去一趟医院",
-    timeText: `${buildReadableDate(dayAfterTomorrowDateKey)} 09:30`,
-    dateKey: dayAfterTomorrowDateKey,
-    startTime: "09:30",
-    endTime: "",
-    timeKind: "time",
-    peopleText: "自己",
-    locationText: "市中心医院",
-    locationName: "市中心医院",
-    note: "",
-    source: "来自发给自己",
-    status: "pending",
-    createdAt: 1760000003000,
-    pinned: false,
-  },
-  {
-    id: "sample-breakfast",
-    title: "到公司帮小林带早餐",
-    timeText: `${buildReadableDate(tomorrowDateKey)} 08:30`,
-    dateKey: tomorrowDateKey,
-    startTime: "08:30",
-    endTime: "",
-    timeKind: "time",
-    peopleText: "小林",
-    locationText: "公司",
-    locationName: "公司",
-    note: "",
-    source: "来自私聊",
-    status: "pending",
-    createdAt: 1760000002000,
-    pinned: false,
-  },
-  {
-    id: "sample-documents",
-    title: "项目资料以后再整理",
-    timeText: "",
-    dateKey: "",
-    startTime: "",
-    endTime: "",
-    timeKind: "none",
-    peopleText: "",
-    locationText: "",
-    locationName: "",
-    note: "",
-    source: "已暂放",
-    status: "later",
-    createdAt: 1760000001000,
-    pinned: false,
-  },
-];
 
 const emptyDraft: ArrangementDraft = {
   title: "",
@@ -321,73 +230,6 @@ function buildEditDraft(item: ArrangementItem): ArrangementEditDraft {
     note: item.note,
     status: item.status,
   };
-}
-
-function normalizeText(value: unknown) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function normalizeStoredArrangement(value: unknown): ArrangementItem | null {
-  if (!value || typeof value !== "object") return null;
-
-  const item = value as Partial<ArrangementItem>;
-  const id = normalizeText(item.id);
-  const title = normalizeText(item.title);
-  if (!id || !title) return null;
-  const locationText = normalizeText(item.locationText);
-  const locationName = normalizeText(item.locationName) || locationText;
-  const dateKey = normalizeText(item.dateKey);
-  const startTime = normalizeText(item.startTime);
-  const endTime = normalizeText(item.endTime);
-
-  return {
-    id,
-    title,
-    timeText: normalizeText(item.timeText),
-    dateKey: isValidDateKey(dateKey) ? dateKey : "",
-    startTime: isValidTimeValue(startTime) ? startTime : "",
-    endTime: isValidTimeValue(endTime) ? endTime : "",
-    timeKind: normalizeTimeKind(item.timeKind),
-    peopleText: normalizeText(item.peopleText),
-    locationText,
-    locationName,
-    note: normalizeText(item.note),
-    source: normalizeText(item.source) || "手动创建",
-    status: normalizeArrangementStatus(item.status),
-    createdAt:
-      typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
-        ? item.createdAt
-        : Date.now(),
-    pinned: item.pinned === true,
-  };
-}
-
-function getInitialArrangements() {
-  if (typeof window === "undefined") return defaultArrangements;
-
-  try {
-    const storedValue = window.localStorage.getItem(arrangementsStorageKey);
-    if (!storedValue) return defaultArrangements;
-    const parsedValue = JSON.parse(storedValue);
-    if (!Array.isArray(parsedValue)) return defaultArrangements;
-
-    const storedArrangements = parsedValue
-      .map(normalizeStoredArrangement)
-      .filter((item): item is ArrangementItem => Boolean(item));
-    return storedArrangements.length > 0 ? storedArrangements : defaultArrangements;
-  } catch {
-    return defaultArrangements;
-  }
-}
-
-function persistArrangements(items: ArrangementItem[]) {
-  if (typeof window === "undefined") return;
-
-  try {
-    window.localStorage.setItem(arrangementsStorageKey, JSON.stringify(items));
-  } catch {
-    // Keep the in-memory arrangement usable when storage is unavailable.
-  }
 }
 
 function formatArrangementCreatedAt(timestamp: number) {
@@ -449,6 +291,9 @@ function groupArrangementsByLocation(items: ArrangementItem[], emptyLocation: st
 export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   const { t } = usePreferences();
   const [arrangements, setArrangements] = React.useState(getInitialArrangements);
+  const [pendingDrafts, setPendingDrafts] = React.useState(
+    getPendingArrangementDrafts
+  );
   const [showCreateSheet, setShowCreateSheet] = React.useState(false);
   const [selectedArrangement, setSelectedArrangement] =
     React.useState<ArrangementItem | null>(null);
@@ -460,7 +305,14 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   );
   const [completionToast, setCompletionToast] =
     React.useState<CompletionToast | null>(null);
+  const [completingArrangementIds, setCompletingArrangementIds] =
+    React.useState<string[]>([]);
   const [detailEditRequest, setDetailEditRequest] = React.useState(0);
+  const [mergeSuggestion, setMergeSuggestion] =
+    React.useState<ArrangementMergeSuggestion | null>(null);
+  const [checkingPendingDraftId, setCheckingPendingDraftId] =
+    React.useState<string | null>(null);
+  const completionAnimationTimeoutsRef = React.useRef<number[]>([]);
   const [dismissedReminderKeys, setDismissedReminderKeys] = React.useState(
     getReminderDismissals
   );
@@ -521,6 +373,30 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   }, [arrangements]);
 
   React.useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const refreshArrangements = () => {
+      setArrangements(getInitialArrangements());
+      setPendingDrafts(getPendingArrangementDrafts());
+    };
+    const refreshArrangementsFromStorage = (event: StorageEvent) => {
+      if (
+        event.key === arrangementsStorageKey ||
+        event.key === pendingArrangementDraftsStorageKey
+      ) {
+        refreshArrangements();
+      }
+    };
+
+    window.addEventListener(arrangementStorageEvent, refreshArrangements);
+    window.addEventListener("storage", refreshArrangementsFromStorage);
+    return () => {
+      window.removeEventListener(arrangementStorageEvent, refreshArrangements);
+      window.removeEventListener("storage", refreshArrangementsFromStorage);
+    };
+  }, []);
+
+  React.useEffect(() => {
     if (!completionToast) return undefined;
 
     const timeoutId = window.setTimeout(() => {
@@ -529,6 +405,15 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
     return () => window.clearTimeout(timeoutId);
   }, [completionToast]);
 
+  React.useEffect(
+    () => () => {
+      completionAnimationTimeoutsRef.current.forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+    },
+    []
+  );
+
   const updateDraft = (key: keyof ArrangementDraft, value: string) => {
     setDraft((current) => ({ ...current, [key]: value }));
   };
@@ -536,6 +421,27 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   const closeCreateSheet = () => {
     setShowCreateSheet(false);
     setDraft(emptyDraft);
+  };
+
+  const finishPendingDraft = (pendingDraftId?: string) => {
+    if (!pendingDraftId) return;
+    removePendingArrangementDraft(pendingDraftId);
+    setPendingDrafts(getPendingArrangementDrafts());
+  };
+
+  const publishArrangements = (items: ArrangementItem[]) => {
+    persistArrangements(items);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(arrangementStorageEvent));
+    }
+  };
+
+  const addArrangement = (arrangement: ArrangementItem, pendingDraftId?: string) => {
+    const nextArrangements = [arrangement, ...arrangements];
+    setArrangements(nextArrangements);
+    publishArrangements(nextArrangements);
+    finishPendingDraft(pendingDraftId);
+    return nextArrangements;
   };
 
   const createArrangement = () => {
@@ -560,7 +466,46 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
       createdAt: now,
       pinned: false,
     };
-    setArrangements((current) => [arrangement, ...current]);
+    addArrangement(arrangement);
+    closeCreateSheet();
+
+    void findSimilarArrangementsWithAi(arrangement, arrangements).then((matches) => {
+      if (matches.length > 0) {
+        setMergeSuggestion({
+          candidate: arrangement,
+          matches,
+          persistedCandidateId: arrangement.id,
+        });
+      }
+    });
+  };
+
+  const createArrangementFromSuggestion = () => {
+    if (!mergeSuggestion) return;
+    if (!mergeSuggestion.persistedCandidateId) {
+      addArrangement(mergeSuggestion.candidate, mergeSuggestion.pendingDraftId);
+    }
+    setMergeSuggestion(null);
+    closeCreateSheet();
+  };
+
+  const mergeArrangementFromSuggestion = (match: SimilarArrangementMatch) => {
+    if (!mergeSuggestion) return;
+
+    const mergedArrangement = mergeSimilarArrangement(
+      match.arrangement,
+      mergeSuggestion.candidate
+    );
+    const nextArrangements = arrangements
+      .filter((item) => item.id !== mergeSuggestion.persistedCandidateId)
+      .map((item) => (item.id === mergedArrangement.id ? mergedArrangement : item));
+    setArrangements(nextArrangements);
+    publishArrangements(nextArrangements);
+    setSelectedArrangement((current) =>
+      current?.id === mergedArrangement.id ? mergedArrangement : current
+    );
+    finishPendingDraft(mergeSuggestion.pendingDraftId);
+    setMergeSuggestion(null);
     closeCreateSheet();
   };
 
@@ -609,8 +554,25 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   };
 
   const completeArrangement = (target: ArrangementItem) => {
-    updateArrangementStatus(target, "completed");
-    setCompletionToast({ item: target, previousStatus: target.status });
+    if (completingArrangementIds.includes(target.id)) return;
+
+    setCompletingArrangementIds((current) =>
+      current.includes(target.id) ? current : [...current, target.id]
+    );
+    setActionTarget((current) => (current?.id === target.id ? null : current));
+    const timeoutId = window.setTimeout(() => {
+      updateArrangementStatus(target, "completed");
+      setCompletionToast({ item: target, previousStatus: target.status });
+      setCompletingArrangementIds((current) =>
+        current.filter((itemId) => itemId !== target.id)
+      );
+      completionAnimationTimeoutsRef.current =
+        completionAnimationTimeoutsRef.current.filter((id) => id !== timeoutId);
+    }, 220);
+    completionAnimationTimeoutsRef.current = [
+      ...completionAnimationTimeoutsRef.current,
+      timeoutId,
+    ];
   };
 
   const postponeArrangement = (target: ArrangementItem) => {
@@ -628,6 +590,9 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
       current.map((item) =>
         item.id === restoredArrangement.id ? restoredArrangement : item
       )
+    );
+    setCompletingArrangementIds((current) =>
+      current.filter((itemId) => itemId !== restoredArrangement.id)
     );
     setSelectedArrangement((current) =>
       current?.id === restoredArrangement.id ? restoredArrangement : current
@@ -664,6 +629,54 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   const completeGentleReminder = (target: ArrangementItem) => {
     dismissGentleReminder(target);
     completeArrangement(target);
+  };
+
+  const acceptPendingDraft = async (draft: PendingArrangementDraft) => {
+    if (checkingPendingDraftId) return;
+
+    const now = Date.now();
+    const arrangement: ArrangementItem = {
+      id: `ai-${now}`,
+      title: draft.title,
+      timeText: draft.timeText,
+      dateKey: draft.dateKey,
+      startTime: draft.startTime,
+      endTime: draft.endTime,
+      timeKind: draft.dateKey ? draft.timeKind : "none",
+      peopleText: draft.peopleText,
+      locationText: draft.locationText,
+      locationName: draft.locationName,
+      note: draft.note,
+      source: draft.source,
+      status: "pending",
+      createdAt: now,
+      pinned: false,
+      contexts: draft.contexts,
+    };
+    setCheckingPendingDraftId(draft.id);
+    try {
+      const matches = await findSimilarArrangementsWithAi(
+        arrangement,
+        arrangements
+      );
+      if (matches.length > 0) {
+        setMergeSuggestion({
+          candidate: arrangement,
+          matches,
+          pendingDraftId: draft.id,
+        });
+        return;
+      }
+
+      addArrangement(arrangement, draft.id);
+    } finally {
+      setCheckingPendingDraftId(null);
+    }
+  };
+
+  const dismissPendingDraft = (draft: PendingArrangementDraft) => {
+    removePendingArrangementDraft(draft.id);
+    setPendingDrafts(getPendingArrangementDrafts());
   };
 
   React.useEffect(() => {
@@ -765,6 +778,15 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
           />
         )}
 
+        {pendingDrafts.length > 0 && (
+          <PendingArrangementDrafts
+            drafts={pendingDrafts}
+            checkingDraftId={checkingPendingDraftId}
+            onAccept={acceptPendingDraft}
+            onDismiss={dismissPendingDraft}
+          />
+        )}
+
         <section className="mt-4">
           <div className="flex h-9 items-center rounded-[10px] bg-surface-muted p-1">
             {([
@@ -815,12 +837,13 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
             </section>
             <section className="mt-3 space-y-2.5">
               {sortedArrangements.map((item) => (
-                <ArrangementCard
-                  key={item.id}
-                  item={item}
-                  onOpen={() => setSelectedArrangement(item)}
-                  onComplete={() => completeArrangement(item)}
-                  onLongPress={() => setActionTarget(item)}
+              <ArrangementCard
+                key={item.id}
+                item={item}
+                isCompleting={completingArrangementIds.includes(item.id)}
+                onOpen={() => setSelectedArrangement(item)}
+                onComplete={() => completeArrangement(item)}
+                onLongPress={() => setActionTarget(item)}
                   onTogglePin={() => toggleArrangementPin(item)}
                   onDelete={() => deleteArrangement(item)}
                 />
@@ -851,6 +874,14 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
         />
       )}
 
+      {mergeSuggestion && (
+        <ArrangementMergeSuggestionSheet
+          suggestion={mergeSuggestion}
+          onCreateNew={createArrangementFromSuggestion}
+          onMerge={mergeArrangementFromSuggestion}
+        />
+      )}
+
       {selectedArrangement && (
         <ArrangementDetailSheet
           item={selectedArrangement}
@@ -877,6 +908,184 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
           onUndo={undoCompleteArrangement}
         />
       )}
+    </div>
+  );
+}
+
+function PendingArrangementDrafts({
+  drafts,
+  checkingDraftId,
+  onAccept,
+  onDismiss,
+}: {
+  drafts: PendingArrangementDraft[];
+  checkingDraftId: string | null;
+  onAccept: (draft: PendingArrangementDraft) => void;
+  onDismiss: (draft: PendingArrangementDraft) => void;
+}) {
+  return (
+    <section className="mt-4 space-y-2.5">
+      <div className="flex items-center justify-between">
+        <h2 className="text-[15px] font-semibold leading-5 text-text">
+          待确认安排
+        </h2>
+        <span className="rounded-full bg-primary-soft px-2 py-1 text-[11px] font-semibold leading-4 text-primary">
+          {drafts.length} 条
+        </span>
+      </div>
+      {drafts.map((draft) => {
+        const isCheckingDraft = checkingDraftId === draft.id;
+        const isBusy = Boolean(checkingDraftId);
+
+        return (
+          <div
+            key={draft.id}
+            className="rounded-[14px] border border-[rgba(9,184,62,0.22)] bg-surface px-3 py-3 shadow-sm"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-[15px] font-semibold leading-5 text-text">
+                  {draft.title}
+                </p>
+                <p className="mt-1 text-[12px] leading-5 text-text-tertiary">
+                  {[draft.timeText, draft.locationName, draft.peopleText]
+                    .filter(Boolean)
+                    .join(" · ") || "时间地点待确认"}
+                </p>
+              </div>
+              <span className="shrink-0 rounded-full bg-primary-soft px-2 py-1 text-[11px] font-semibold leading-4 text-primary">
+                {Math.round(draft.confidence * 100)}%
+              </span>
+            </div>
+            {draft.note && (
+              <p className="mt-2 rounded-[10px] bg-surface-muted px-2.5 py-2 text-[12px] leading-5 text-text-muted">
+                {draft.note}
+              </p>
+            )}
+            {draft.contexts[0] && (
+              <p className="mt-2 line-clamp-2 text-[12px] leading-5 text-text-tertiary">
+                来源：{draft.contexts[0]}
+              </p>
+            )}
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                className="h-9 rounded-[9px] border border-border bg-surface text-[13px] font-medium text-text-muted transition active:scale-[0.98] disabled:text-text-disabled"
+                disabled={isBusy}
+                onClick={() => onDismiss(draft)}
+              >
+                忽略
+              </button>
+              <button
+                type="button"
+                className="h-9 rounded-[9px] bg-primary text-[13px] font-semibold text-on-primary transition active:scale-[0.98] disabled:opacity-60"
+                disabled={isBusy}
+                onClick={() => onAccept(draft)}
+              >
+                {isCheckingDraft ? "判断中..." : "加入安排"}
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+function ArrangementMergeSuggestionSheet({
+  suggestion,
+  onCreateNew,
+  onMerge,
+}: {
+  suggestion: ArrangementMergeSuggestion;
+  onCreateNew: () => void;
+  onMerge: (match: SimilarArrangementMatch) => void;
+}) {
+  const candidateMeta =
+    [
+      suggestion.candidate.timeText,
+      suggestion.candidate.locationName || suggestion.candidate.locationText,
+      suggestion.candidate.peopleText,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "时间地点待确认";
+
+  return (
+    <div className="absolute inset-0 z-[60] flex items-end">
+      <div className="absolute inset-0 bg-overlay" aria-hidden="true" />
+      <section
+        className="relative z-10 max-h-[88%] w-full overflow-y-auto rounded-t-[16px] border border-border-light bg-[var(--dialog-bg)] px-4 pb-4 pt-2.5 shadow-[0_-12px_36px_rgba(0,0,0,0.18)]"
+        role="dialog"
+        aria-modal="true"
+        aria-label="可能相关安排"
+      >
+        <div className="mx-auto mb-3 h-1 w-9 rounded-full bg-fill-2" />
+        <div className="rounded-[14px] border border-[rgba(9,184,62,0.22)] bg-primary-soft/50 px-3.5 py-3">
+          <p className="text-[13px] font-semibold leading-5 text-primary">
+            可能相关安排
+          </p>
+          <h2 className="mt-1 text-[17px] font-semibold leading-6 text-text">
+            {suggestion.candidate.title}
+          </h2>
+          <p className="mt-1 text-[12px] leading-5 text-text-muted">
+            {candidateMeta}
+          </p>
+        </div>
+
+        <div className="mt-3 space-y-2.5">
+          {suggestion.matches.map((match) => (
+            <div
+              key={match.arrangement.id}
+              className="rounded-[14px] bg-surface px-3.5 py-3 shadow-sm"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[15px] font-semibold leading-5 text-text">
+                    {match.arrangement.title}
+                  </p>
+                  <p className="mt-1 text-[12px] leading-5 text-text-tertiary">
+                    {[
+                      match.arrangement.timeText,
+                      match.arrangement.locationName || match.arrangement.locationText,
+                      match.arrangement.peopleText,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ") || "时间地点待确认"}
+                  </p>
+                </div>
+                <span className="shrink-0 rounded-full bg-surface-muted px-2 py-1 text-[11px] font-semibold leading-4 text-text-muted">
+                  {Math.round(match.score * 100)}%
+                </span>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {match.reasons.map((reason) => (
+                  <span
+                    key={reason}
+                    className="rounded-full bg-primary-soft px-2 py-0.5 text-[11px] leading-4 text-primary"
+                  >
+                    {reason}
+                  </span>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="mt-3 h-9 w-full rounded-[9px] bg-primary text-[13px] font-semibold text-on-primary transition active:scale-[0.98]"
+                onClick={() => onMerge(match)}
+              >
+                合并到已有安排
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <button
+          type="button"
+          className="mt-3 h-10 w-full rounded-[10px] border border-border bg-surface text-[13px] font-semibold text-text-muted transition active:scale-[0.98]"
+          onClick={onCreateNew}
+        >
+          仍然创建新安排
+        </button>
+      </section>
     </div>
   );
 }
@@ -1302,6 +1511,7 @@ function ArrangementStat({ value, label }: { value: string; label: string }) {
 
 function ArrangementCard({
   item,
+  isCompleting,
   onOpen,
   onComplete,
   onLongPress,
@@ -1309,6 +1519,7 @@ function ArrangementCard({
   onDelete,
 }: {
   item: ArrangementItem;
+  isCompleting: boolean;
   onOpen: () => void;
   onComplete: () => void;
   onLongPress: () => void;
@@ -1317,9 +1528,12 @@ function ArrangementCard({
 }) {
   const { t } = usePreferences();
   const [dragOffset, setDragOffset] = React.useState(0);
+  const [swipePhase, setSwipePhase] = React.useState<
+    "idle" | "dragging" | "snapping"
+  >("idle");
+  const dragOffsetRef = React.useRef(0);
   const dragStartXRef = React.useRef(0);
   const dragInitialOffsetRef = React.useRef(0);
-  const latestDeltaXRef = React.useRef(0);
   const draggingRef = React.useRef(false);
   const suppressClickRef = React.useRef(false);
   const longPressTimerRef = React.useRef<number | null>(null);
@@ -1331,7 +1545,7 @@ function ArrangementCard({
   ].filter(Boolean);
   const metaText = metaParts.length > 0 ? metaParts.join(" · ") : t("arrangements.noTime");
   const actionWidth = 132;
-  const swipeOpenThreshold = 40;
+  const swipeOpenThreshold = actionWidth / 2;
 
   const clearLongPressTimer = () => {
     if (longPressTimerRef.current === null) return;
@@ -1341,23 +1555,50 @@ function ArrangementCard({
 
   React.useEffect(() => clearLongPressTimer, []);
 
+  const updateDragOffset = (value: number) => {
+    dragOffsetRef.current = value;
+    setDragOffset(value);
+  };
+
+  const snapDragOffset = (value: number) =>
+    Math.abs(value) >= swipeOpenThreshold ? -actionWidth : 0;
+
+  const setClosed = () => {
+    setSwipePhase("snapping");
+    updateDragOffset(0);
+    draggingRef.current = false;
+  };
+
+  const finishDrag = (forceClose = false) => {
+    const nextOffset = forceClose ? 0 : snapDragOffset(dragOffsetRef.current);
+    setSwipePhase("snapping");
+    updateDragOffset(nextOffset);
+    draggingRef.current = false;
+    window.setTimeout(() => {
+      suppressClickRef.current = false;
+    }, 0);
+  };
+
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (isCompleting) return;
+
+    event.currentTarget.setPointerCapture(event.pointerId);
     dragStartXRef.current = event.clientX;
-    dragInitialOffsetRef.current = dragOffset;
-    latestDeltaXRef.current = 0;
+    dragInitialOffsetRef.current = dragOffsetRef.current;
     draggingRef.current = false;
     clearLongPressTimer();
     longPressTimerRef.current = window.setTimeout(() => {
       suppressClickRef.current = true;
       draggingRef.current = false;
-      setDragOffset(0);
+      setClosed();
       onLongPress();
     }, 500);
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (isCompleting) return;
+
     const deltaX = event.clientX - dragStartXRef.current;
-    latestDeltaXRef.current = deltaX;
     const nextOffset = Math.max(
       -actionWidth,
       Math.min(0, dragInitialOffsetRef.current + deltaX)
@@ -1367,57 +1608,82 @@ function ArrangementCard({
     clearLongPressTimer();
     draggingRef.current = true;
     suppressClickRef.current = true;
-    setDragOffset(nextOffset);
+    setSwipePhase("dragging");
+    updateDragOffset(nextOffset);
   };
 
-  const handlePointerEnd = () => {
+  const handlePointerEnd = (event: React.PointerEvent<HTMLDivElement>) => {
     clearLongPressTimer();
-    if (!draggingRef.current) return;
-
-    if (latestDeltaXRef.current > 0) {
-      setDragOffset(0);
-    } else {
-      setDragOffset((current) =>
-        Math.abs(current) >= swipeOpenThreshold ? -actionWidth : 0
-      );
+    if (!draggingRef.current) {
+      if (dragOffsetRef.current !== 0 && dragOffsetRef.current !== -actionWidth) {
+        finishDrag();
+      }
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      return;
     }
-    window.setTimeout(() => {
-      suppressClickRef.current = false;
-    }, 0);
+
+    finishDrag();
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const handleLostPointerCapture = () => {
+    clearLongPressTimer();
+    if (draggingRef.current) {
+      finishDrag();
+      return;
+    }
+    if (dragOffsetRef.current !== 0 && dragOffsetRef.current !== -actionWidth) {
+      finishDrag();
+    }
   };
 
   const handleOpen = () => {
+    if (isCompleting) return;
+
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       return;
     }
 
-    if (dragOffset !== 0) {
-      setDragOffset(0);
+    if (dragOffsetRef.current !== 0) {
+      setClosed();
       return;
     }
 
+    setClosed();
     onOpen();
   };
 
   const handleComplete = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
     clearLongPressTimer();
+    setClosed();
     onComplete();
   };
 
   const handleTogglePin = () => {
+    setClosed();
     onTogglePin();
-    setDragOffset(0);
   };
 
   const handleDelete = () => {
+    setClosed();
     onDelete();
-    setDragOffset(0);
   };
 
   return (
-    <div className="relative overflow-hidden rounded-[12px]">
+    <div
+      className={cn(
+        "relative overflow-hidden rounded-[12px] transition-[opacity,transform] duration-200 ease-out",
+        isCompleting
+          ? "pointer-events-none scale-95 opacity-0"
+          : "scale-100 opacity-100"
+      )}
+    >
       <div className="absolute inset-y-0 right-0 flex items-stretch overflow-hidden rounded-[12px]">
         <button
           type="button"
@@ -1437,12 +1703,23 @@ function ArrangementCard({
       <div
         role="button"
         tabIndex={0}
-        className="relative block w-full rounded-[12px] border border-border-light bg-surface px-3.5 py-3 text-left shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition-[background,transform] duration-150 hover:bg-[var(--record-card-hover-bg)] active:scale-[0.99]"
+        className={cn(
+          "relative block w-full rounded-[12px] border border-border-light bg-surface px-3.5 py-3 text-left shadow-[0_1px_2px_rgba(15,23,42,0.04)] hover:bg-[var(--record-card-hover-bg)] active:scale-[0.99]",
+          swipePhase === "dragging"
+            ? "transition-[background]"
+            : "transition-[background,transform] duration-150 ease-out"
+        )}
         style={{ transform: `translateX(${dragOffset}px)` }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerEnd}
         onPointerCancel={handlePointerEnd}
+        onLostPointerCapture={handleLostPointerCapture}
+        onTransitionEnd={(event) => {
+          if (event.propertyName === "transform") {
+            setSwipePhase("idle");
+          }
+        }}
         onClick={handleOpen}
         onKeyDown={(event) => {
           if (event.key !== "Enter" && event.key !== " ") return;
@@ -1555,6 +1832,7 @@ function ArrangementDetailSheet({
         ? t("arrangements.statusLater")
         : t("arrangements.statusPending");
   const canSave = editDraft.title.trim().length > 0;
+  const contexts = (visibleItem.contexts || []).filter(Boolean);
   const detailRows = [
     {
       label: t("arrangements.fieldTime"),
@@ -1739,6 +2017,29 @@ function ArrangementDetailSheet({
                   </div>
                 ))}
               </section>
+
+              {contexts.length > 0 && (
+                <section className="mt-3 rounded-[12px] bg-surface px-3.5 py-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[14px] font-semibold leading-5 text-text">
+                      相关上下文
+                    </p>
+                    <span className="rounded-full bg-surface-muted px-2 py-0.5 text-[11px] leading-4 text-text-muted">
+                      {contexts.length} 条
+                    </span>
+                  </div>
+                  <div className="mt-2 space-y-2">
+                    {contexts.map((context, index) => (
+                      <p
+                        key={`${index}-${context}`}
+                        className="whitespace-pre-wrap rounded-[10px] bg-surface-muted px-3 py-2 text-[12px] leading-5 text-text-muted"
+                      >
+                        {context}
+                      </p>
+                    ))}
+                  </div>
+                </section>
+              )}
             </>
           )}
         </div>

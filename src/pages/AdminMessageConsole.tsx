@@ -1,5 +1,12 @@
 import React from "react";
+import {
+  recognizeArrangementFromGroupChat,
+  recognizeArrangementFromPrivateChat,
+} from "@/ai/aiArrangementRecognition";
 import { AiApiError, callAiJson } from "@/ai/aiClient";
+import {
+  appendPendingArrangementDrafts,
+} from "@/arrangements/arrangementStorage";
 import {
   createTestGroup,
   createTestGroupMessage,
@@ -25,6 +32,10 @@ import { formatBubbleTime, formatTimeLabel } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
 const adminMessageModeStorageKey = "arkme-demo.adminMessageMode";
+const pushedPrivateRecognitionMessageIdsStorageKey =
+  "arkme-demo.pushedPrivateRecognitionMessageIds";
+const pushedGroupRecognitionMessageIdsStorageKey =
+  "arkme-demo.pushedGroupRecognitionMessageIds";
 const aiTestPrompt =
   "请返回一个 JSON 对象，用于验证 AI API 调用是否正常。字段包括 summary、status、nextStep。summary 用一句中文说明连接正常。";
 
@@ -32,6 +43,13 @@ type AiTestResult =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "success"; output: unknown }
+  | { status: "error"; message: string };
+
+type AutoRecognitionStatus =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; message: string }
+  | { status: "info"; message: string }
   | { status: "error"; message: string };
 
 function getInitialAdminMessageMode(): TestConversationType {
@@ -45,6 +63,94 @@ function persistAdminMessageMode(mode: TestConversationType) {
   if (typeof window === "undefined") return;
 
   window.localStorage.setItem(adminMessageModeStorageKey, mode);
+}
+
+function buildDateKey(timestamp: number) {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function isTodayTimestamp(timestamp: number) {
+  return buildDateKey(timestamp) === buildDateKey(Date.now());
+}
+
+function getPushedPrivateRecognitionMessageIds() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(
+      pushedPrivateRecognitionMessageIdsStorageKey
+    );
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistPushedPrivateRecognitionMessageIds(messageIds: string[]) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      pushedPrivateRecognitionMessageIdsStorageKey,
+      JSON.stringify(Array.from(new Set(messageIds)))
+    );
+  } catch {
+    // Recognition dedupe is a convenience; keep message sending usable.
+  }
+}
+
+function markPrivateRecognitionMessagesPushed(messageIds: string[]) {
+  if (messageIds.length === 0) return;
+
+  persistPushedPrivateRecognitionMessageIds([
+    ...getPushedPrivateRecognitionMessageIds(),
+    ...messageIds,
+  ]);
+}
+
+function getPushedGroupRecognitionMessageIds() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(
+      pushedGroupRecognitionMessageIdsStorageKey
+    );
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistPushedGroupRecognitionMessageIds(messageIds: string[]) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      pushedGroupRecognitionMessageIdsStorageKey,
+      JSON.stringify(Array.from(new Set(messageIds)))
+    );
+  } catch {
+    // Recognition dedupe is a convenience; keep message sending usable.
+  }
+}
+
+function markGroupRecognitionMessagesPushed(messageIds: string[]) {
+  if (messageIds.length === 0) return;
+
+  persistPushedGroupRecognitionMessageIds([
+    ...getPushedGroupRecognitionMessageIds(),
+    ...messageIds,
+  ]);
 }
 
 function getLatestIdentityMessage(messages: TestMessage[], identityId: string) {
@@ -90,6 +196,8 @@ export default function AdminMessageConsole() {
   const [aiTestResult, setAiTestResult] = React.useState<AiTestResult>({
     status: "idle",
   });
+  const [autoRecognitionStatus, setAutoRecognitionStatus] =
+    React.useState<AutoRecognitionStatus>({ status: "idle" });
   const [messageTextFocused, setMessageTextFocused] = React.useState(false);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const identityPickerRef = React.useRef<HTMLDivElement>(null);
@@ -317,9 +425,11 @@ export default function AdminMessageConsole() {
     if (!activeIdentity || !messageText.trim()) return;
     if (messageMode === "group" && !activeGroup) return;
 
+    const sendingMode = messageMode;
+    const activeConversationIdentityId = activeIdentity.id;
     setMessages((prev) => {
       const nextMessage =
-        messageMode === "group" && activeGroup
+        sendingMode === "group" && activeGroup
           ? createTestGroupMessage(activeGroup.id, activeIdentity.id, messageText)
           : createTestMessage(activeIdentity.id, messageText);
       const nextMessages = [
@@ -327,8 +437,25 @@ export default function AdminMessageConsole() {
         nextMessage,
       ];
       persistTestMessages(nextMessages);
+      if (sendingMode === "private") {
+        void recognizePrivateMessageArrangements(
+          nextMessages,
+          nextMessage.conversationId,
+          activeConversationIdentityId
+        );
+      } else if (activeGroup) {
+        void recognizeGroupMessageArrangements(
+          nextMessages,
+          nextMessage.conversationId
+        );
+      }
       return nextMessages;
     });
+    if (sendingMode === "private" || sendingMode === "group") {
+      setAutoRecognitionStatus({
+        status: "loading",
+      });
+    }
     setMessageText("");
   };
 
@@ -353,6 +480,133 @@ export default function AdminMessageConsole() {
         message: getAiTestErrorMessage(error),
       });
     }
+  };
+
+  const recognizePrivateMessageArrangements = async (
+    nextMessages: TestMessage[],
+    conversationId: string,
+    identityId: string
+  ) => {
+    const pushedMessageIds = new Set(getPushedPrivateRecognitionMessageIds());
+    const recognitionMessages = nextMessages
+      .filter(
+        (message) =>
+          message.conversationId === conversationId &&
+          message.conversationType === "private" &&
+          message.sender === "identity" &&
+          isTodayTimestamp(message.sentAt) &&
+          !pushedMessageIds.has(message.id)
+      )
+      .sort((a, b) => a.sentAt - b.sentAt)
+      .slice(-8);
+
+    if (recognitionMessages.length === 0) {
+      setAutoRecognitionStatus({
+        status: "info",
+        message: "今天没有新的未推送私聊内容需要识别。",
+      });
+      return;
+    }
+
+    const contextText = buildPrivateConversationContext(
+      recognitionMessages,
+      identities,
+      conversationId,
+      identityId
+    );
+    const result = await recognizeArrangementFromPrivateChat(contextText);
+
+    if (result.status === "success") {
+      appendPendingArrangementDrafts(
+        result.drafts.map((draft) => ({
+          ...draft,
+          source: result.source,
+        }))
+      );
+      markPrivateRecognitionMessagesPushed(
+        recognitionMessages.map((message) => message.id)
+      );
+      setAutoRecognitionStatus({
+        status: "success",
+        message: `已识别到 ${result.drafts.length} 条待确认安排，已推送到移动端安排页。`,
+      });
+      return;
+    }
+
+    if (result.status === "not_configured") {
+      setAutoRecognitionStatus({ status: "info", message: result.message });
+      return;
+    }
+
+    if (result.status === "empty") {
+      setAutoRecognitionStatus({ status: "info", message: "未识别到安排。" });
+      return;
+    }
+
+    setAutoRecognitionStatus({ status: "error", message: result.message });
+  };
+
+  const recognizeGroupMessageArrangements = async (
+    nextMessages: TestMessage[],
+    conversationId: string
+  ) => {
+    const pushedMessageIds = new Set(getPushedGroupRecognitionMessageIds());
+    const recognitionMessages = nextMessages
+      .filter(
+        (message) =>
+          message.conversationId === conversationId &&
+          message.conversationType === "group" &&
+          isTodayTimestamp(message.sentAt) &&
+          !pushedMessageIds.has(message.id)
+      )
+      .sort((a, b) => a.sentAt - b.sentAt)
+      .slice(-12);
+
+    if (recognitionMessages.length === 0) {
+      setAutoRecognitionStatus({
+        status: "info",
+        message: "今天没有新的未推送群聊内容需要识别。",
+      });
+      return;
+    }
+
+    const contextText = buildGroupConversationContext(
+      recognitionMessages,
+      identities
+    );
+    const result = await recognizeArrangementFromGroupChat(contextText);
+
+    if (result.status === "success") {
+      appendPendingArrangementDrafts(
+        result.drafts.map((draft) => ({
+          ...draft,
+          source: "ai_group_chat",
+        }))
+      );
+      markGroupRecognitionMessagesPushed(
+        recognitionMessages.map((message) => message.id)
+      );
+      setAutoRecognitionStatus({
+        status: "success",
+        message: `已识别到 ${result.drafts.length} 条群聊待确认安排，已推送到移动端安排页。`,
+      });
+      return;
+    }
+
+    if (result.status === "not_configured") {
+      setAutoRecognitionStatus({ status: "info", message: result.message });
+      return;
+    }
+
+    if (result.status === "empty") {
+      setAutoRecognitionStatus({
+        status: "info",
+        message: "未识别到需要我完成的群聊安排。",
+      });
+      return;
+    }
+
+    setAutoRecognitionStatus({ status: "error", message: result.message });
   };
 
   return (
@@ -484,6 +738,7 @@ export default function AdminMessageConsole() {
           </div>
 
           <div className="shrink-0 bg-[var(--admin-panel-bg)] px-5 pb-4 pt-3">
+            <AutoRecognitionStatusPanel status={autoRecognitionStatus} />
             <AiTestResultPanel result={aiTestResult} />
             {activeIdentity ? (
               <div
@@ -708,6 +963,67 @@ export default function AdminMessageConsole() {
           </form>
         </div>
       )}
+    </div>
+  );
+}
+
+function buildPrivateConversationContext(
+  messages: TestMessage[],
+  identities: TestIdentity[],
+  conversationId: string,
+  identityId: string
+) {
+  const identityName =
+    identities.find((identity) => identity.id === identityId)?.name ?? "对方";
+
+  return messages
+    .filter((message) => message.conversationId === conversationId)
+    .sort((a, b) => a.sentAt - b.sentAt)
+    .slice(-8)
+    .map((message) => {
+      const speaker = message.sender === "demo" ? "我" : identityName;
+      return `${speaker}：${message.text}`;
+    })
+    .join("\n");
+}
+
+function buildGroupConversationContext(
+  messages: TestMessage[],
+  identities: TestIdentity[]
+) {
+  return messages
+    .sort((a, b) => a.sentAt - b.sentAt)
+    .map((message) => {
+      const speaker =
+        message.sender === "demo"
+          ? "我"
+          : identities.find((identity) => identity.id === message.identityId)
+              ?.name ?? "群成员";
+      return `${speaker}：${message.text}`;
+    })
+    .join("\n");
+}
+
+function AutoRecognitionStatusPanel({ status }: { status: AutoRecognitionStatus }) {
+  if (status.status === "idle") return null;
+
+  const isError = status.status === "error";
+  const isSuccess = status.status === "success";
+  const message =
+    status.status === "loading" ? "正在自动识别私聊里的安排..." : status.message;
+
+  return (
+    <div
+      className={cn(
+        "mb-3 rounded-[12px] border px-3 py-2.5 text-[12px] leading-5",
+        isError
+          ? "border-[rgba(244,99,99,0.22)] bg-[rgba(244,99,99,0.08)] text-danger"
+          : isSuccess
+            ? "border-[rgba(9,184,62,0.22)] bg-primary-soft text-primary"
+            : "border-[var(--admin-border-subtle)] bg-[var(--admin-panel-muted-bg)] text-text-tertiary"
+      )}
+    >
+      {message}
     </div>
   );
 }
