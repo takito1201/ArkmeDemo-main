@@ -4781,4 +4781,102 @@ export const aiConversationLogEntries: AiConversationLogEntry[] = [
       "已创建 tag：v0.1.0",
     ],
   },
+  {
+    timestamp: "2026-05-20 14:34:00 CST (+0800)",
+    userInput:
+      "v0.1.1 AI API 设置基础设施 该配置将用于后续“安排识别”。预留一个 getAiApiSettings() / hasAiApiSettings() 方法，供下一版 AI 识别调用",
+    aiFinalOutput:
+      "已给出 v0.1.1 AI API 设置基础设施方案：新增 localStorage 配置模块，预留 getAiApiSettings() / hasAiApiSettings()，在“我的 -> 设置”加入 AI API 设置页，支持 Base URL、API Key、Model 保存和清除，API Key 脱敏展示，本版不真实调用 AI，并明确后续“安排识别”只通过该读取入口获取配置。",
+    changedFiles: ["无"],
+    verification: [
+      "已读取 AGENTS.md 和 docs/candidate-rules.md",
+      "已检查 .codex/candidate-session.json 指向当前候选人个人日志",
+      "已检查个人 Markdown 日志和 src/data/aiConversationLog.ts 的最新记录状态",
+      "已只读检查设置页、偏好配置、首页路由和相关 UI 结构",
+      "方案阶段未修改代码，未运行构建",
+    ],
+  },
+  {
+    timestamp: "2026-05-20 15:41:13 CST (+0800)",
+    userInput:
+      "PLEASE IMPLEMENT THIS PLAN: 实现 v0.1.1 AI API 设置基础设施，新增 localStorage 配置模块和 getAiApiSettings() / hasAiApiSettings()，在“我的 -> 设置”新增 AI API 设置页，支持 Base URL、API Key、Model 保存与清除，API Key 脱敏展示，本版不真实调用 AI，并用于后续“安排识别”。",
+    aiFinalOutput:
+      "已实现 v0.1.1 AI API 设置基础设施：新增 `getAiApiSettings()` / `hasAiApiSettings()` 等本地配置入口，并在“我的 -> 设置”加入“AI API 设置”页面。页面支持保存 Base URL、API Key、Model 到 localStorage，支持二次确认清除；已保存的 API Key 只显示脱敏摘要，留空保存会保留旧 Key。本版没有接入真实 AI 调用，后续“安排识别”可以直接复用 `src/settings/aiApiSettings.ts` 的读取方法。测试入口：http://127.0.0.1:5173/\n\n验证方面：TypeScript 诊断 0、ESLint 0 errors/0 warnings、Vite build 通过、日志格式检查通过，本地 Vite server 已启动并确认 `http://127.0.0.1:5173/` 返回 200。`pnpm verify:answer` 因当前工具权限审批超时未能直接执行。",
+    changedFiles: [
+      "src/settings/aiApiSettings.ts",
+      "src/pages/Home.tsx",
+      "src/settings/preferences.ts",
+      "docs/codex-logs/candidate-陈奕泰-zhiliao-codexsandboxoffline-20260519T111941-550f3ec2.md",
+      "src/data/aiConversationLog.ts",
+    ],
+    verification: [
+      "已先补齐上一轮方案记录到个人 Markdown 日志和 src/data/aiConversationLog.ts，并补齐 v0.1.0 记录到个人 Markdown 日志",
+      "TypeScript 进程内检查通过，diagnosticCount=0",
+      "ESLint 进程内检查通过，errorCount=0，warningCount=0",
+      "Vite build 进程内构建通过",
+      "Codex 日志格式进程内检查通过：个人 Markdown 日志 32 条记录，invalidCount=0，UI 数据源字段完整",
+      "本地 Vite server 已启动，http://127.0.0.1:5173/ 返回 200",
+      "pnpm.cmd lint、pnpm.cmd build、pnpm.cmd verify:answer 的权限审批均超时，未能通过 shell 直接执行",
+    ],
+  },
+  {
+    timestamp: "2026-05-20 16:23:01 CST (+0800)",
+    userInput:
+      "先实现 AI 调用基础层，不要做安排识别业务。要求新增 `src/ai/aiClient.ts`，只能通过 `getAiApiSettings()` / `hasAiApiSettings()` 读取配置，不直接访问 localStorage，实现 `callAiJson(prompt)`，调用用户配置的 Base URL、API Key、Model，返回 JSON 结果，处理未配置、请求失败、JSON 解析失败，不输出 API Key，并暂时只在 `/sendtest` 页面加“测试 AI 调用”按钮，成功后显示 AI 返回摘要或 JSON。",
+    aiFinalOutput:
+      "已给出 AI 调用基础层方案：新增 `src/ai/aiClient.ts`，实现 OpenAI-compatible JSON 调用，支持 Base URL 双模式拼接 `/chat/completions`，定义未配置、请求失败、JSON 解析失败三类错误；`/sendtest` 增加测试按钮和结果展示区，成功优先展示 `summary`，否则展示格式化 JSON，失败展示安全文案且不暴露 API Key。",
+    changedFiles: ["无"],
+    verification: [
+      "已确认上一轮 v0.1.1 AI API 设置基础设施记录存在于个人 Markdown 日志和 src/data/aiConversationLog.ts",
+      "已只读检查 `src/settings/aiApiSettings.ts`、`src/pages/AdminMessageConsole.tsx` 和 `src/App.tsx`",
+      "方案阶段未修改代码，未运行构建",
+    ],
+  },
+  {
+    timestamp: "2026-05-20 16:30:51 CST (+0800)",
+    userInput:
+      "PLEASE IMPLEMENT THIS PLAN: 实现 AI 调用基础层方案。新增通用 AI JSON 调用层，不实现安排识别业务；`src/ai/aiClient.ts` 只能通过 `getAiApiSettings()` / `hasAiApiSettings()` 读取配置，不直接访问 localStorage；实现 `callAiJson(prompt)` 调用用户配置的 Base URL、API Key、Model，返回 JSON，处理未配置、请求失败、JSON 解析失败；`/sendtest` 增加“测试 AI 调用”按钮和结果展示区，成功显示摘要或 JSON，不输出 API Key。",
+    aiFinalOutput:
+      "已实现 AI 调用基础层：新增 `src/ai/aiClient.ts`，导出 `callAiJson(prompt)`、`AiApiError` 和错误码类型，按 OpenAI-compatible Chat Completions 协议调用用户配置的 Base URL、API Key、Model，并支持 Base URL 双模式：完整 `/chat/completions` 端点直连，否则自动拼接。`aiClient` 仅通过 `getAiApiSettings()` / `hasAiApiSettings()` 读取配置，没有直接访问 localStorage，也没有 console 输出。\n\n`/sendtest` 页面已新增“测试 AI 调用”按钮和结果面板：点击后使用固定测试 prompt 调用 AI；loading 时按钮禁用；成功时优先展示 JSON 的 `summary` 字段，否则格式化展示 JSON；未配置、请求失败、JSON 解析失败都会显示安全文案，不展示 API Key、Authorization header 或底层异常对象。测试入口：http://127.0.0.1:5173/sendtest",
+    changedFiles: [
+      "src/ai/aiClient.ts",
+      "src/pages/AdminMessageConsole.tsx",
+      "docs/codex-logs/candidate-陈奕泰-zhiliao-codexsandboxoffline-20260519T111941-550f3ec2.md",
+      "src/data/aiConversationLog.ts",
+    ],
+    verification: [
+      "已先补齐上一轮 AI 调用基础层方案记录到个人 Markdown 日志和 src/data/aiConversationLog.ts",
+      "静态检查确认 `src/ai/aiClient.ts` 不包含 localStorage 和 console，并导入 `getAiApiSettings()` / `hasAiApiSettings()`",
+      "TypeScript 进程内检查通过，diagnosticCount=0",
+      "ESLint 进程内检查通过，errorCount=0，warningCount=0",
+      "Vite build 进程内构建通过",
+      "本地烟测通过：http://127.0.0.1:5173/ 返回 200，http://127.0.0.1:5173/sendtest 返回 200",
+      "pnpm.cmd verify:answer 权限审批超时，未能通过 shell 直接执行",
+    ],
+  },
+  {
+    timestamp: "2026-05-20 17:35:52 CST (+0800)",
+    userInput: "将当前版本设为v0.1.1.1",
+    aiFinalOutput:
+      "已将当前功能版本整理为 Git 版本 `v0.1.1.1`：确认上一轮日志已同步，检查当前 Git 状态和已有 tag，仅将 AI API 设置、AI 调用基础层、测试入口与本轮日志相关文件纳入提交，排除了无关未跟踪文件 `新建 文本文档.txt`。由于 `0.1.1.1` 不是 npm 标准 semver，未把 `package.json` 的 version 改成无效版本号；版本以 Git tag `v0.1.1.1` 表达。",
+    changedFiles: [
+      "src/ai/aiClient.ts",
+      "src/pages/AdminMessageConsole.tsx",
+      "src/pages/Home.tsx",
+      "src/settings/aiApiSettings.ts",
+      "src/settings/preferences.ts",
+      "docs/codex-logs/candidate-陈奕泰-zhiliao-codexsandboxoffline-20260519T111941-550f3ec2.md",
+      "src/data/aiConversationLog.ts",
+    ],
+    verification: [
+      "已确认上一轮 AI 调用基础层记录存在于个人 Markdown 日志和 src/data/aiConversationLog.ts",
+      "git status 检查发现 AI API 相关改动未提交，且存在无关未跟踪文件 `新建 文本文档.txt`",
+      "TypeScript 进程内检查通过，diagnosticCount=0",
+      "ESLint 进程内检查通过，errorCount=0，warningCount=0",
+      "Vite build 进程内构建通过",
+      "将相关文件提交为 `chore(release): mark v0.1.1.1`",
+      "已创建 Git tag：v0.1.1.1",
+      "已修正本轮日志的改动文件列表，并将 `v0.1.1.1` tag 指向修正后的 release commit",
+    ],
+  },
 ];

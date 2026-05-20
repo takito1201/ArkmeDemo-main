@@ -1,4 +1,5 @@
 import React from "react";
+import { AiApiError, callAiJson } from "@/ai/aiClient";
 import {
   createTestGroup,
   createTestGroupMessage,
@@ -24,6 +25,14 @@ import { formatBubbleTime, formatTimeLabel } from "@/lib/time";
 import { cn } from "@/lib/utils";
 
 const adminMessageModeStorageKey = "arkme-demo.adminMessageMode";
+const aiTestPrompt =
+  "请返回一个 JSON 对象，用于验证 AI API 调用是否正常。字段包括 summary、status、nextStep。summary 用一句中文说明连接正常。";
+
+type AiTestResult =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; output: unknown }
+  | { status: "error"; message: string };
 
 function getInitialAdminMessageMode(): TestConversationType {
   if (typeof window === "undefined") return "private";
@@ -78,6 +87,9 @@ export default function AdminMessageConsole() {
   const [groupName, setGroupName] = React.useState("");
   const [groupNote, setGroupNote] = React.useState("");
   const [messageText, setMessageText] = React.useState("");
+  const [aiTestResult, setAiTestResult] = React.useState<AiTestResult>({
+    status: "idle",
+  });
   const [messageTextFocused, setMessageTextFocused] = React.useState(false);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const identityPickerRef = React.useRef<HTMLDivElement>(null);
@@ -329,6 +341,20 @@ export default function AdminMessageConsole() {
     handleSendMessage();
   };
 
+  const handleTestAiCall = async () => {
+    setAiTestResult({ status: "loading" });
+
+    try {
+      const output = await callAiJson(aiTestPrompt);
+      setAiTestResult({ status: "success", output });
+    } catch (error) {
+      setAiTestResult({
+        status: "error",
+        message: getAiTestErrorMessage(error),
+      });
+    }
+  };
+
   return (
     <div
       className="flex h-[calc(100vh-48px)] w-full self-stretch flex-col overflow-hidden bg-[var(--admin-bg)] text-text"
@@ -458,6 +484,7 @@ export default function AdminMessageConsole() {
           </div>
 
           <div className="shrink-0 bg-[var(--admin-panel-bg)] px-5 pb-4 pt-3">
+            <AiTestResultPanel result={aiTestResult} />
             {activeIdentity ? (
               <div
                 className="admin-message-input-shell mx-auto w-full rounded-[14px] border bg-[var(--admin-input-bg)] transition hover:bg-[var(--admin-input-hover-bg)]"
@@ -514,6 +541,16 @@ export default function AdminMessageConsole() {
                     </div>
                   </div>
                   <div className="ml-auto flex shrink-0 items-center gap-3">
+                    <button
+                      type="button"
+                      className="h-8 rounded-[8px] border border-[var(--admin-border)] px-3 text-[12px] font-medium text-text transition hover:border-primary hover:text-primary active:scale-[0.98] disabled:cursor-wait disabled:opacity-50 focus:outline-none focus-visible:[box-shadow:var(--admin-input-focus-shadow)]"
+                      onClick={handleTestAiCall}
+                      disabled={aiTestResult.status === "loading"}
+                    >
+                      {aiTestResult.status === "loading"
+                        ? "测试中..."
+                        : "测试 AI 调用"}
+                    </button>
                     <span className="text-[12px] leading-5 text-text-tertiary">
                       Enter发送 / Shift+Enter换行
                     </span>
@@ -671,6 +708,64 @@ export default function AdminMessageConsole() {
           </form>
         </div>
       )}
+    </div>
+  );
+}
+
+function getAiTestErrorMessage(error: unknown) {
+  if (error instanceof AiApiError) {
+    if (error.code === "AI_API_NOT_CONFIGURED") {
+      return "请先在移动端 Demo 的 AI API 设置中完成配置。";
+    }
+
+    if (error.code === "AI_API_JSON_PARSE_FAILED") {
+      return "AI 已返回内容，但不是合法 JSON。";
+    }
+
+    return "AI 请求失败，请检查 Base URL、Model 或网络状态。";
+  }
+
+  return "AI 请求失败，请稍后重试。";
+}
+
+function getAiTestDisplayText(output: unknown) {
+  if (output && typeof output === "object" && !Array.isArray(output)) {
+    const summary = (output as { summary?: unknown }).summary;
+    if (typeof summary === "string" && summary.trim()) {
+      return summary.trim();
+    }
+  }
+
+  return JSON.stringify(output, null, 2);
+}
+
+function AiTestResultPanel({ result }: { result: AiTestResult }) {
+  if (result.status === "idle") return null;
+
+  if (result.status === "loading") {
+    return (
+      <div className="mb-3 rounded-[12px] border border-[var(--admin-border-subtle)] bg-[var(--admin-panel-muted-bg)] px-3 py-2.5 text-[12px] leading-5 text-text-tertiary">
+        正在测试 AI 调用...
+      </div>
+    );
+  }
+
+  if (result.status === "error") {
+    return (
+      <div className="mb-3 rounded-[12px] border border-[rgba(244,99,99,0.22)] bg-[rgba(244,99,99,0.08)] px-3 py-2.5 text-[12px] leading-5 text-danger">
+        {result.message}
+      </div>
+    );
+  }
+
+  return (
+    <div className="mb-3 rounded-[12px] border border-[rgba(9,184,62,0.22)] bg-primary-soft px-3 py-2.5">
+      <p className="text-[12px] font-semibold leading-5 text-primary">
+        AI 测试成功
+      </p>
+      <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[12px] leading-5 text-text">
+        {getAiTestDisplayText(result.output)}
+      </pre>
     </div>
   );
 }

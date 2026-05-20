@@ -34,6 +34,14 @@ import {
 import { formatBubbleTime, formatTimeLabel } from "@/lib/time";
 import { cn } from "@/lib/utils";
 import {
+  clearAiApiSettings,
+  getAiApiSettings,
+  hasAiApiSettings,
+  maskAiApiKey,
+  saveAiApiSettings,
+  type AiApiSettings,
+} from "@/settings/aiApiSettings";
+import {
   accentColorOptions,
   getLocaleDisplayName,
   supportedLocales,
@@ -51,6 +59,8 @@ type HomeProps = {
   currentPage: PageType;
   onNavigate: (page: PageType) => void;
 };
+
+type SettingsView = null | "settings" | "appearance" | "about" | "aiApi";
 
 type TabItem = {
   key: PageType;
@@ -344,9 +354,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [sendToSelfTargetUid, setSendToSelfTargetUid] = React.useState<string | null>(null);
   const [activeTestIdentityId, setActiveTestIdentityId] = React.useState<string | null>(null);
   const [testConversationTargetUid, setTestConversationTargetUid] = React.useState<string | null>(null);
-  const [settingsView, setSettingsView] = React.useState<null | "settings" | "appearance" | "about">(
-    null
-  );
+  const [settingsView, setSettingsView] = React.useState<SettingsView>(null);
   const [searchQuery, setSearchQuery] = React.useState("");
   const [searchHistory, setSearchHistory] = React.useState(getInitialSearchHistory);
   const [recordDetail, setRecordDetail] = React.useState<RecordItem | null>(null);
@@ -1093,11 +1101,16 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <AboutScreen onBack={() => setSettingsView(null)} />;
     }
 
+    if (settingsView === "aiApi") {
+      return <AiApiSettingsScreen onBack={() => setSettingsView("settings")} />;
+    }
+
     if (settingsView === "settings") {
       return (
         <SettingsScreen
           onBack={() => setSettingsView(null)}
           onOpenAppearance={() => setSettingsView("appearance")}
+          onOpenAiApi={() => setSettingsView("aiApi")}
         />
       );
     }
@@ -3174,9 +3187,11 @@ function MineActionCard({
 
 function SettingsScreen({
   onBack,
+  onOpenAiApi,
   onOpenAppearance,
 }: {
   onBack: () => void;
+  onOpenAiApi: () => void;
   onOpenAppearance: () => void;
 }) {
   const { localeCode, resolvedLocale, t } = usePreferences();
@@ -3194,6 +3209,15 @@ function SettingsScreen({
             onClick={onOpenAppearance}
           />
           <SettingsListItem
+            title={t("settings.aiApi")}
+            description={
+              hasAiApiSettings()
+                ? t("settings.aiApiConfigured")
+                : t("settings.aiApiNotConfigured")
+            }
+            onClick={onOpenAiApi}
+          />
+          <SettingsListItem
             title={t("settings.language")}
             description={`${t("settings.current")}：${
               localeCode === ""
@@ -3209,6 +3233,189 @@ function SettingsScreen({
         <LanguageSheet onClose={() => setShowLanguageSheet(false)} />
       )}
     </div>
+  );
+}
+
+function AiApiSettingsScreen({ onBack }: { onBack: () => void }) {
+  const { t } = usePreferences();
+  const [savedSettings, setSavedSettings] = React.useState<AiApiSettings | null>(
+    () => getAiApiSettings()
+  );
+  const [baseUrl, setBaseUrl] = React.useState(savedSettings?.baseUrl ?? "");
+  const [apiKey, setApiKey] = React.useState("");
+  const [model, setModel] = React.useState(savedSettings?.model ?? "");
+  const [message, setMessage] = React.useState("");
+  const [clearArmed, setClearArmed] = React.useState(false);
+
+  const configured = Boolean(
+    savedSettings?.baseUrl && savedSettings.apiKey && savedSettings.model
+  );
+  const maskedApiKey = savedSettings?.apiKey ? maskAiApiKey(savedSettings.apiKey) : "";
+
+  const handleSave = () => {
+    const nextBaseUrl = baseUrl.trim();
+    const nextApiKey = apiKey.trim() || savedSettings?.apiKey || "";
+    const nextModel = model.trim();
+
+    setClearArmed(false);
+
+    if (nextBaseUrl && !/^https?:\/\//i.test(nextBaseUrl)) {
+      setMessage(t("aiApi.baseUrlInvalid"));
+      return;
+    }
+
+    if (!nextBaseUrl || !nextApiKey || !nextModel) {
+      setMessage(t("aiApi.required"));
+      return;
+    }
+
+    const nextSettings = saveAiApiSettings({
+      baseUrl: nextBaseUrl,
+      apiKey: nextApiKey,
+      model: nextModel,
+    });
+
+    setSavedSettings(nextSettings);
+    setBaseUrl(nextSettings?.baseUrl ?? "");
+    setApiKey("");
+    setModel(nextSettings?.model ?? "");
+    setMessage(t("aiApi.saved"));
+  };
+
+  const handleClear = () => {
+    if (!clearArmed) {
+      setClearArmed(true);
+      setMessage(t("aiApi.clearConfirm"));
+      return;
+    }
+
+    clearAiApiSettings();
+    setSavedSettings(null);
+    setBaseUrl("");
+    setApiKey("");
+    setModel("");
+    setClearArmed(false);
+    setMessage(t("aiApi.cleared"));
+  };
+
+  return (
+    <div className="flex h-full flex-col bg-bg">
+      <MobilePageHeader title={t("aiApi.title")} onBack={onBack} />
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-5 pt-3">
+        <section className="rounded-[12px] bg-surface px-3 py-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="text-[15px] font-semibold leading-5 text-text">
+                {t("aiApi.status")}
+              </h2>
+              <p className="mt-1 text-xs leading-5 text-text-tertiary">
+                {t("aiApi.description")}
+              </p>
+            </div>
+            <span
+              className={cn(
+                "shrink-0 rounded-full px-2 py-1 text-[11px] font-semibold leading-4",
+                configured
+                  ? "bg-primary-soft text-primary"
+                  : "bg-surface-muted text-text-tertiary"
+              )}
+            >
+              {configured ? t("aiApi.configured") : t("aiApi.notConfigured")}
+            </span>
+          </div>
+        </section>
+
+        <section className="mt-3 rounded-[12px] bg-surface px-3 pb-3 pt-3">
+          <AiApiField
+            id="ai-api-base-url"
+            label={t("aiApi.baseUrl")}
+            placeholder={t("aiApi.baseUrlPlaceholder")}
+            value={baseUrl}
+            onChange={setBaseUrl}
+          />
+          <AiApiField
+            id="ai-api-key"
+            label={t("aiApi.apiKey")}
+            placeholder={
+              maskedApiKey
+                ? t("aiApi.apiKeyKeepPlaceholder")
+                : t("aiApi.apiKeyPlaceholder")
+            }
+            type="password"
+            value={apiKey}
+            onChange={setApiKey}
+          />
+          {maskedApiKey && (
+            <p className="-mt-1 mb-3 text-xs leading-5 text-text-tertiary">
+              {t("aiApi.savedKey")}：{maskedApiKey}
+            </p>
+          )}
+          <AiApiField
+            id="ai-api-model"
+            label={t("aiApi.model")}
+            placeholder={t("aiApi.modelPlaceholder")}
+            value={model}
+            onChange={setModel}
+          />
+
+          {message && (
+            <p className="mb-3 rounded-[10px] bg-primary-soft px-3 py-2 text-xs leading-5 text-primary">
+              {message}
+            </p>
+          )}
+
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={handleClear}
+              className="h-11 rounded-[10px] border border-border bg-surface text-sm font-semibold text-text-muted transition active:scale-[0.98]"
+            >
+              {clearArmed ? t("aiApi.confirmClear") : t("aiApi.clear")}
+            </button>
+            <button
+              type="button"
+              onClick={handleSave}
+              className="h-11 rounded-[10px] bg-primary text-sm font-semibold text-on-primary transition active:scale-[0.98]"
+            >
+              {t("aiApi.save")}
+            </button>
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function AiApiField({
+  id,
+  label,
+  onChange,
+  placeholder,
+  type = "text",
+  value,
+}: {
+  id: string;
+  label: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  type?: "password" | "text";
+  value: string;
+}) {
+  return (
+    <label htmlFor={id} className="mb-3 block">
+      <span className="mb-1.5 block text-xs font-semibold leading-4 text-text-muted">
+        {label}
+      </span>
+      <input
+        id={id}
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-11 w-full rounded-[10px] border border-border bg-input-bg px-3 text-sm text-text transition placeholder:text-input-placeholder focus:border-input-border-focus focus:bg-input-bg-focus focus:outline-none"
+      />
+    </label>
   );
 }
 
