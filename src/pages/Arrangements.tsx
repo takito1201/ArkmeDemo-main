@@ -31,6 +31,7 @@ type ArrangementsProps = {
 
 type ArrangementView = "list" | "calendar";
 type ArrangementListSort = "created" | "time";
+type ArrangementStatSheet = "pending" | "timed" | "later";
 
 type CompletionToast = {
   item: ArrangementItem;
@@ -312,6 +313,8 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
     React.useState<ArrangementMergeSuggestion | null>(null);
   const [checkingPendingDraftId, setCheckingPendingDraftId] =
     React.useState<string | null>(null);
+  const [activeStatSheet, setActiveStatSheet] =
+    React.useState<ArrangementStatSheet | null>(null);
   const completionAnimationTimeoutsRef = React.useRef<number[]>([]);
   const [dismissedReminderKeys, setDismissedReminderKeys] = React.useState(
     getReminderDismissals
@@ -330,6 +333,20 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
   const pendingArrangements = React.useMemo(
     () => arrangements.filter((item) => item.status === "pending"),
     [arrangements]
+  );
+  const laterArrangements = React.useMemo(
+    () =>
+      arrangements
+        .filter((item) => item.status === "later")
+        .sort(sortArrangementsByCreated),
+    [arrangements]
+  );
+  const timedArrangements = React.useMemo(
+    () =>
+      visibleArrangements
+        .filter((item) => item.dateKey)
+        .sort(sortArrangementsByTime),
+    [visibleArrangements]
   );
   const timedCount = visibleArrangements.filter((item) => item.dateKey).length;
   const sortedArrangements = React.useMemo(
@@ -367,6 +384,26 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
       ),
     [arrangements, dismissedReminderKeys]
   );
+  const activeStatSheetItems =
+    activeStatSheet === "pending"
+      ? pendingArrangements
+      : activeStatSheet === "timed"
+        ? timedArrangements
+        : activeStatSheet === "later"
+          ? laterArrangements
+          : [];
+  const activeStatSheetTitle =
+    activeStatSheet === "pending"
+      ? t("arrangements.statPending")
+      : activeStatSheet === "timed"
+        ? t("arrangements.statTimed")
+        : t("arrangements.statLater");
+  const activeStatSheetEmpty =
+    activeStatSheet === "pending"
+      ? t("arrangements.pendingSheetEmpty")
+      : activeStatSheet === "timed"
+        ? t("arrangements.timedSheetEmpty")
+        : t("arrangements.laterSheetEmpty");
 
   React.useEffect(() => {
     persistArrangements(arrangements);
@@ -756,14 +793,20 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
             <ArrangementStat
               value={String(pendingCount)}
               label={t("arrangements.statPending")}
+              onClick={() => setActiveStatSheet("pending")}
+              ariaLabel={t("arrangements.openPendingItems")}
             />
             <ArrangementStat
               value={String(timedCount)}
               label={t("arrangements.statTimed")}
+              onClick={() => setActiveStatSheet("timed")}
+              ariaLabel={t("arrangements.openTimedItems")}
             />
             <ArrangementStat
               value={String(laterCount)}
               label={t("arrangements.statLater")}
+              onClick={() => setActiveStatSheet("later")}
+              ariaLabel={t("arrangements.openLaterItems")}
             />
           </div>
         </section>
@@ -879,6 +922,19 @@ export default function Arrangements({ onOpenMenu }: ArrangementsProps) {
           suggestion={mergeSuggestion}
           onCreateNew={createArrangementFromSuggestion}
           onMerge={mergeArrangementFromSuggestion}
+        />
+      )}
+
+      {activeStatSheet && (
+        <ArrangementStatItemsSheet
+          title={activeStatSheetTitle}
+          emptyText={activeStatSheetEmpty}
+          items={activeStatSheetItems}
+          onClose={() => setActiveStatSheet(null)}
+          onOpenItem={(item) => {
+            setActiveStatSheet(null);
+            setSelectedArrangement(item);
+          }}
         />
       )}
 
@@ -1498,13 +1554,151 @@ function CompletionToastBar({
   );
 }
 
-function ArrangementStat({ value, label }: { value: string; label: string }) {
-  return (
-    <div className="rounded-[12px] bg-surface px-3 py-2.5 text-center shadow-[0_1px_2px_rgba(15,23,42,0.04)]">
+function ArrangementStat({
+  value,
+  label,
+  onClick,
+  ariaLabel,
+}: {
+  value: string;
+  label: string;
+  onClick?: () => void;
+  ariaLabel?: string;
+}) {
+  const className =
+    "rounded-[12px] bg-surface px-3 py-2.5 text-center shadow-[0_1px_2px_rgba(15,23,42,0.04)]";
+  const content = (
+    <>
       <p className="text-[20px] font-semibold leading-6 text-text">{value}</p>
       <p className="mt-1 truncate text-[11px] leading-4 text-text-muted">
         {label}
       </p>
+    </>
+  );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className={`${className} transition hover:bg-hover-overlay active:scale-[0.98]`}
+        onClick={onClick}
+        aria-label={ariaLabel || label}
+      >
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    <div className={className}>
+      {content}
+    </div>
+  );
+}
+
+function ArrangementStatItemsSheet({
+  title,
+  emptyText,
+  items,
+  onClose,
+  onOpenItem,
+}: {
+  title: string;
+  emptyText: string;
+  items: ArrangementItem[];
+  onClose: () => void;
+  onOpenItem: (item: ArrangementItem) => void;
+}) {
+  const { t } = usePreferences();
+
+  return (
+    <div className="absolute inset-0 z-50 flex items-end">
+      <button
+        type="button"
+        className="absolute inset-0 bg-overlay"
+        onClick={onClose}
+        aria-label={t("arrangements.closeStatItems")}
+      />
+      <section
+        className="relative z-10 max-h-[78%] w-full overflow-hidden rounded-t-[16px] border border-border-light bg-[var(--dialog-bg)] shadow-[0_-12px_36px_rgba(0,0,0,0.18)]"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+      >
+        <header className="border-b border-border-light px-4 pb-3 pt-2.5">
+          <div className="mx-auto mb-3 h-1 w-9 rounded-full bg-fill-2" />
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="text-[17px] font-semibold leading-6 text-text">
+                {title}
+              </h2>
+              <p className="mt-0.5 text-[12px] leading-4 text-text-tertiary">
+                {items.length} {t("arrangements.itemCountUnit")}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="h-8 rounded-full px-2 text-[13px] font-medium text-primary transition active:scale-[0.96]"
+              onClick={onClose}
+            >
+              {t("common.done")}
+            </button>
+          </div>
+        </header>
+
+        <div className="max-h-[calc(78vh-82px)] overflow-y-auto px-4 py-3">
+          {items.length > 0 ? (
+            <div className="space-y-2.5">
+              {items.map((item) => {
+                const meta =
+                  [item.timeText, item.peopleText, item.locationName || item.locationText]
+                    .filter(Boolean)
+                    .join(" · ") || t("arrangements.noTime");
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="flex w-full items-start gap-3 rounded-[12px] bg-surface px-3.5 py-3 text-left shadow-[0_1px_2px_rgba(15,23,42,0.04)] transition hover:bg-hover-overlay active:scale-[0.99]"
+                    onClick={() => onOpenItem(item)}
+                  >
+                    <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-text-tertiary/40" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[15px] font-medium leading-5 text-text">
+                        {item.title}
+                      </span>
+                      <span className="mt-1 block truncate text-[12px] leading-4 text-text-muted">
+                        {meta}
+                      </span>
+                      <span className="mt-2 block text-[11px] leading-4 text-text-tertiary">
+                        {item.source}
+                      </span>
+                    </span>
+                    <svg
+                      className="mt-1 h-4 w-4 shrink-0 text-text-tertiary"
+                      viewBox="0 0 16 16"
+                      fill="none"
+                      xmlns="http://www.w3.org/2000/svg"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M6 4L10 8L6 12"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="rounded-[12px] bg-surface-muted px-3.5 py-4 text-[13px] leading-5 text-text-muted">
+              {emptyText}
+            </p>
+          )}
+        </div>
+      </section>
     </div>
   );
 }
