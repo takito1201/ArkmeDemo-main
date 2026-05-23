@@ -7,6 +7,17 @@ import RecordDetailSheet from "@/components/RecordDetailSheet";
 import RecordFullDetailScreen from "@/components/RecordFullDetailScreen";
 import Arrangements from "@/pages/Arrangements";
 import Records from "@/pages/Records";
+import {
+  appendArrangement,
+  appendPendingArrangementDrafts,
+  arrangementStorageEvent,
+  getInitialArrangements,
+  getPendingArrangementDrafts,
+  pendingArrangementDraftsStorageKey,
+  removePendingArrangementDraft,
+  type ArrangementItem,
+  type PendingArrangementDraft,
+} from "@/arrangements/arrangementStorage";
 import { aiConversationLogEntries } from "@/data/aiConversationLog";
 import { useCandidateProfile } from "@/data/candidateProfile";
 import {
@@ -60,7 +71,7 @@ type HomeProps = {
   onNavigate: (page: PageType) => void;
 };
 
-type SettingsView = null | "settings" | "appearance" | "about" | "aiApi";
+type SettingsView = null | "settings" | "appearance" | "about" | "aiApi" | "aliases";
 
 type TabItem = {
   key: PageType;
@@ -76,6 +87,12 @@ const tabs: TabItem[] = [
 const aiConversationReadCountStorageKey = "arkme-demo.aiConversationReadCount";
 const browserNotificationPromptedStorageKey = "arkme-demo.browserNotificationPrompted";
 const createdSelfRecordsStorageKey = "arkme-demo.selfRecords";
+const chatAliasMapStorageKey = "arkme-demo.chatAliasMap";
+const chatAliasMapStorageEvent = "arkme-demo.chatAliasMap.updated";
+const aliasLearningConfirmationsStorageKey =
+  "arkme-demo.aliasLearningConfirmations";
+const aliasLearningHandledMessageIdsStorageKey =
+  "arkme-demo.aliasLearningHandledMessageIds";
 const searchHistoryStorageKey = "arkme-demo.searchHistory";
 const aiConversationTotalCount = aiConversationLogEntries.length;
 const maxSearchHistoryCount = 4;
@@ -116,6 +133,372 @@ type HomeMessagePreview = {
   message: TestMessage;
   unreadCount: number;
 };
+
+type ChatAliasEntry = {
+  id: string;
+  conversationId: string;
+  conversationType: TestConversationType;
+  alias: string;
+  meaning: string;
+  scope?: "conversation" | "contact" | "global";
+  sourceMessageIds?: string[];
+  sourceSummary?: string;
+  createdAt?: number;
+  updatedAt: number;
+};
+
+type AliasLearningConfirmation = {
+  id: string;
+  conversationId: string;
+  conversationType: TestConversationType;
+  alias: string;
+  candidates: { meaning: string; arrangementId?: string }[];
+  sourceMessageIds: string[];
+  sourceSummary: string;
+  mode: "existing_arrangement" | "qa";
+  defaultScope: "conversation" | "contact" | "global";
+  createdAt: number;
+};
+
+function normalizeText(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeChatAliasEntry(value: unknown): ChatAliasEntry | null {
+  if (!value || typeof value !== "object") return null;
+
+  const item = value as Partial<ChatAliasEntry>;
+  const id = normalizeText(item.id);
+  const conversationId = normalizeText(item.conversationId);
+  const alias = normalizeText(item.alias);
+  const meaning = normalizeText(item.meaning);
+  if (!id || !conversationId || !alias || !meaning) return null;
+
+  return {
+    id,
+    conversationId,
+    conversationType: item.conversationType === "group" ? "group" : "private",
+    alias,
+    meaning,
+    scope:
+      item.scope === "contact" || item.scope === "global"
+        ? item.scope
+        : "conversation",
+    sourceMessageIds: Array.isArray(item.sourceMessageIds)
+      ? item.sourceMessageIds.map(normalizeText).filter(Boolean)
+      : [],
+    sourceSummary: normalizeText(item.sourceSummary),
+    createdAt:
+      typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+        ? item.createdAt
+        : undefined,
+    updatedAt:
+      typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
+        ? item.updatedAt
+        : Date.now(),
+  };
+}
+
+function getInitialChatAliases() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(chatAliasMapStorageKey);
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue
+          .map(normalizeChatAliasEntry)
+          .filter((item): item is ChatAliasEntry => Boolean(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeAliasLearningConfirmation(
+  value: unknown
+): AliasLearningConfirmation | null {
+  if (!value || typeof value !== "object") return null;
+
+  const item = value as Partial<AliasLearningConfirmation>;
+  const id = normalizeText(item.id);
+  const conversationId = normalizeText(item.conversationId);
+  const alias = normalizeText(item.alias);
+  const candidates = Array.isArray(item.candidates)
+    ? item.candidates
+        .map((candidate) => ({
+          meaning: normalizeText(candidate.meaning),
+          arrangementId: normalizeText(candidate.arrangementId),
+        }))
+        .filter((candidate) => candidate.meaning)
+    : [];
+  if (!id || !conversationId || !alias || candidates.length === 0) return null;
+
+  return {
+    id,
+    conversationId,
+    conversationType: item.conversationType === "group" ? "group" : "private",
+    alias,
+    candidates,
+    sourceMessageIds: Array.isArray(item.sourceMessageIds)
+      ? item.sourceMessageIds.map(normalizeText).filter(Boolean)
+      : [],
+    sourceSummary: normalizeText(item.sourceSummary),
+    mode: item.mode === "qa" ? "qa" : "existing_arrangement",
+    defaultScope:
+      item.defaultScope === "contact" || item.defaultScope === "global"
+        ? item.defaultScope
+        : "conversation",
+    createdAt:
+      typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+        ? item.createdAt
+        : Date.now(),
+  };
+}
+
+function getInitialAliasLearningConfirmations() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(
+      aliasLearningConfirmationsStorageKey
+    );
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue
+          .map(normalizeAliasLearningConfirmation)
+          .filter(
+            (item): item is AliasLearningConfirmation => Boolean(item)
+          )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistAliasLearningConfirmations(
+  confirmations: AliasLearningConfirmation[]
+) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      aliasLearningConfirmationsStorageKey,
+      JSON.stringify(confirmations)
+    );
+    window.dispatchEvent(new Event(arrangementStorageEvent));
+  } catch {
+    // Alias learning is a convenience layer.
+  }
+}
+
+function getAliasLearningHandledMessageIds() {
+  if (typeof window === "undefined") return new Set<string>();
+
+  try {
+    const storedValue = window.localStorage.getItem(
+      aliasLearningHandledMessageIdsStorageKey
+    );
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return new Set(
+      Array.isArray(parsedValue)
+        ? parsedValue.map(normalizeText).filter(Boolean)
+        : []
+    );
+  } catch {
+    return new Set<string>();
+  }
+}
+
+function persistAliasLearningHandledMessageIds(ids: Set<string>) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      aliasLearningHandledMessageIdsStorageKey,
+      JSON.stringify(Array.from(ids).slice(-240))
+    );
+  } catch {
+    // Handled ids are only used to reduce duplicate prompts.
+  }
+}
+
+function findUnknownAlias(text: string, aliases: ChatAliasEntry[]) {
+  const match = text.match(
+    /~~+|～～+|[~～]{2,}|[＊*]{2,}|[?？]{2,}|老样子|那个|A计划/
+  );
+  const alias = match?.[0] ?? "";
+  if (!alias) return "";
+  return aliases.some((item) => item.alias === alias) ? "" : alias;
+}
+
+function isArrangementLikeText(text: string) {
+  return /(今天|明天|后天|待会儿|今晚|晚上|下午|上午|周[一二三四五六日天]|去|见|约|一起|安排|计划|可以|行|好|没问题)/.test(
+    text
+  );
+}
+
+function isConfirmationText(text: string) {
+  return /^(可以|行|好|好的|没问题|就这样|嗯|OK|ok|走|去)$/.test(
+    text.trim()
+  );
+}
+
+function getUnknownAliasTimeText(text: string) {
+  if (text.includes("明天")) return "明天";
+  if (text.includes("今晚")) return "今晚";
+  if (text.includes("今天")) return "今天";
+  if (text.includes("后天")) return "后天";
+  if (text.includes("待会儿")) return "待会儿";
+  const weekMatch = text.match(/周[一二三四五六日天]/);
+  return weekMatch?.[0] ?? "";
+}
+
+function buildUnknownAliasTitle(text: string, alias: string) {
+  const withoutTime = text
+    .replace(/^(今天|明天|后天|今晚|待会儿)/, "")
+    .replace(/[？?。！!，,]+$/g, "")
+    .trim();
+  if (withoutTime.includes(alias)) return withoutTime;
+  return alias;
+}
+
+function stripArrangementMeaning(title: string) {
+  return title
+    .replace(/^(今天|明天|后天|待会儿|今晚|晚上|下午|上午)/, "")
+    .replace(/^去/, "")
+    .replace(/^(一起|和.+?一起)/, "")
+    .trim();
+}
+
+function guessAliasMeaningFromArrangements(
+  message: TestMessage,
+  arrangements: ArrangementItem[]
+) {
+  const messageDateKey = new Date(message.sentAt).toISOString().slice(0, 10);
+  const candidate = arrangements.find(
+    (item) =>
+      item.sourceConversationId === message.conversationId ||
+      item.dateKey === messageDateKey ||
+      item.timeText.includes("今天")
+  );
+  return candidate ? stripArrangementMeaning(candidate.title) || candidate.title : "";
+}
+
+function buildAliasSourceSummary(
+  messages: TestMessage[],
+  identities: TestIdentity[]
+) {
+  return messages
+    .slice(-3)
+    .map((message) => {
+      const speaker =
+        message.sender === "demo"
+          ? "我"
+          : identities.find((identity) => identity.id === message.identityId)
+              ?.name ?? "对方";
+      return `${speaker}：${message.text}`;
+    })
+    .join(" / ");
+}
+
+function inferAliasKind(alias: string, meaning: string) {
+  return /(地点|地址|老地方|门口|店|馆|学校|医院|图书馆|会议室|楼|路|号|咖啡厅|奶茶店|餐厅|车站)/.test(
+    `${alias} ${meaning}`
+  )
+    ? "location"
+    : "activity";
+}
+
+function buildRawAliasArrangementDraft(
+  message: TestMessage,
+  sourceSummary: string,
+  alias = findUnknownAlias(message.text, []),
+  suggestedAliasMeaning = ""
+): Omit<PendingArrangementDraft, "id" | "createdAt"> {
+  const hasTomorrow = message.text.includes("明天");
+  const hasTonight = message.text.includes("今晚");
+  const hasToday = message.text.includes("今天");
+  const date = new Date(message.sentAt);
+  if (hasTomorrow) date.setDate(date.getDate() + 1);
+  const dateKey =
+    hasToday || hasTomorrow || hasTonight
+      ? date.toISOString().slice(0, 10)
+      : "";
+  const timeText = getUnknownAliasTimeText(message.text);
+
+  return {
+    title: buildUnknownAliasTitle(message.text, alias) || message.text,
+    timeText,
+    dateKey,
+    startTime: "",
+    endTime: "",
+    timeKind: dateKey ? "allDay" : "none",
+    peopleText: "",
+    locationText: "",
+    locationName: "",
+    note: "未知暗语，已按原文生成待确认事项。",
+    confidence: 0.72,
+    contexts: [sourceSummary],
+    source: "rules",
+    sourceConversationId: message.conversationId,
+    sourceConversationType: message.conversationType,
+    sourceMessageIds: [message.id],
+    sourceType: "unknown_alias_arrangement",
+    unknownAliasText: alias,
+    suggestedAliasMeaning,
+    aliasLearningStatus: suggestedAliasMeaning ? "suggested" : undefined,
+  };
+}
+
+function buildKnownAliasArrangementDraft(
+  message: TestMessage,
+  alias: ChatAliasEntry,
+  sourceSummary: string
+): Omit<PendingArrangementDraft, "id" | "createdAt"> {
+  const replacedText = message.text.split(alias.alias).join(alias.meaning);
+  const rawDraft = buildRawAliasArrangementDraft(
+    { ...message, text: replacedText },
+    sourceSummary
+  );
+  const aliasKind = inferAliasKind(alias.alias, alias.meaning);
+
+  return {
+    ...rawDraft,
+    title:
+      aliasKind === "activity"
+        ? rawDraft.title
+        : message.text.replace(alias.alias, "").trim() || rawDraft.title,
+    locationText: aliasKind === "location" ? alias.meaning : rawDraft.locationText,
+    locationName: aliasKind === "location" ? alias.meaning : rawDraft.locationName,
+    note: "",
+    confidence: 0.86,
+    contexts: [sourceSummary, `原文：${message.text}`, `识别：${replacedText}`],
+    sourceMessageIds: [message.id],
+    sourceType: undefined,
+  };
+}
+
+function isAliasActiveForConversation(
+  alias: ChatAliasEntry,
+  summary: TestConversationSummary
+) {
+  if (alias.scope === "global") return true;
+  return (
+    alias.conversationId === summary.conversationId &&
+    alias.conversationType === summary.conversationType
+  );
+}
+
+function persistChatAliases(aliases: ChatAliasEntry[]) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(chatAliasMapStorageKey, JSON.stringify(aliases));
+  } catch {
+    // Alias settings are best-effort local preferences.
+  }
+}
 
 const quickSearchTypes: QuickSearchType[] = [
   "image",
@@ -371,6 +754,12 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [testMessages, setTestMessages] = React.useState(getInitialTestMessages);
   const [testReadState, setTestReadState] =
     React.useState<TestReadState>(getInitialTestReadState);
+  const [pendingArrangementDrafts, setPendingArrangementDrafts] = React.useState(
+    getPendingArrangementDrafts
+  );
+  const [chatAliases, setChatAliases] = React.useState(getInitialChatAliases);
+  const [, setAliasLearningConfirmations] =
+    React.useState(getInitialAliasLearningConfirmations);
   const initializedBrowserNotificationMessagesRef = React.useRef(false);
   const browserNotifiedMessageIdsRef = React.useRef<Set<string>>(new Set());
 
@@ -406,6 +795,42 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     return () => {
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener(testConversationStorageEvent, refreshTestConversations);
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const refreshPendingArrangementDrafts = () => {
+      setPendingArrangementDrafts(getPendingArrangementDrafts());
+      setAliasLearningConfirmations(getInitialAliasLearningConfirmations());
+    };
+    const refreshChatAliases = () => {
+      setChatAliases(getInitialChatAliases());
+    };
+
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === pendingArrangementDraftsStorageKey) {
+        refreshPendingArrangementDrafts();
+      }
+      if (event.key === aliasLearningConfirmationsStorageKey) {
+        setAliasLearningConfirmations(getInitialAliasLearningConfirmations());
+      }
+      if (event.key === chatAliasMapStorageKey) {
+        refreshChatAliases();
+      }
+    };
+
+    window.addEventListener("storage", handleStorage);
+    window.addEventListener(arrangementStorageEvent, refreshPendingArrangementDrafts);
+    window.addEventListener(chatAliasMapStorageEvent, refreshChatAliases);
+    return () => {
+      window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(
+        arrangementStorageEvent,
+        refreshPendingArrangementDrafts
+      );
+      window.removeEventListener(chatAliasMapStorageEvent, refreshChatAliases);
     };
   }, []);
 
@@ -1018,6 +1443,123 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     testMessages,
   ]);
 
+  React.useEffect(() => {
+    const latestMessage = [...testMessages].sort((a, b) => a.sentAt - b.sentAt).at(-1);
+    if (!latestMessage) return;
+
+    const summary = testConversationSummaries.find(
+      (item) =>
+        item.conversationId === latestMessage.conversationId &&
+        item.conversationType === latestMessage.conversationType
+    );
+    if (!summary) return;
+
+    const handledIds = getAliasLearningHandledMessageIds();
+    if (handledIds.has(latestMessage.id)) return;
+
+    const existingConfirmations = getInitialAliasLearningConfirmations();
+    const existingDrafts = getPendingArrangementDrafts();
+    const isAlreadyQueued = [...existingConfirmations, ...existingDrafts].some(
+      (item) => item.sourceMessageIds?.includes(latestMessage.id)
+    );
+    if (isAlreadyQueued) return;
+
+    const conversationMessages = testMessages
+      .filter(
+        (message) =>
+          message.conversationId === latestMessage.conversationId &&
+          message.conversationType === latestMessage.conversationType
+      )
+      .sort((a, b) => a.sentAt - b.sentAt);
+    const activeAliases = chatAliases.filter((alias) =>
+      isAliasActiveForConversation(alias, summary)
+    );
+    const sourceSummary = buildAliasSourceSummary(
+      conversationMessages,
+      testIdentities
+    );
+
+    if (isConfirmationText(latestMessage.text)) {
+      const previousMessage = conversationMessages.at(-2);
+      const previousAlias = previousMessage
+        ? findUnknownAlias(previousMessage.text, activeAliases)
+        : "";
+      const previousAlreadyQueued =
+        previousMessage &&
+        [...existingConfirmations, ...existingDrafts].some((item) =>
+          item.sourceMessageIds?.includes(previousMessage.id)
+        );
+      if (
+        previousMessage &&
+        previousAlias &&
+        !previousAlreadyQueued &&
+        isArrangementLikeText(previousMessage.text)
+      ) {
+        appendPendingArrangementDrafts([
+          {
+            ...buildRawAliasArrangementDraft(
+              previousMessage,
+              sourceSummary,
+              previousAlias,
+              guessAliasMeaningFromArrangements(
+                previousMessage,
+                getInitialArrangements()
+              )
+            ),
+            sourceMessageIds: [previousMessage.id, latestMessage.id],
+          },
+        ]);
+        setPendingArrangementDrafts(getPendingArrangementDrafts());
+        handledIds.add(previousMessage.id);
+        handledIds.add(latestMessage.id);
+        persistAliasLearningHandledMessageIds(handledIds);
+      }
+      return;
+    }
+
+    if (!isArrangementLikeText(latestMessage.text)) return;
+
+    const matchedAlias = activeAliases.find((alias) =>
+      latestMessage.text.includes(alias.alias)
+    );
+    if (matchedAlias) {
+      appendPendingArrangementDrafts([
+        buildKnownAliasArrangementDraft(
+          latestMessage,
+          matchedAlias,
+          sourceSummary
+        ),
+      ]);
+      setPendingArrangementDrafts(getPendingArrangementDrafts());
+      handledIds.add(latestMessage.id);
+      persistAliasLearningHandledMessageIds(handledIds);
+      return;
+    }
+
+    const unknownAlias = findUnknownAlias(latestMessage.text, activeAliases);
+    if (!unknownAlias) return;
+
+    appendPendingArrangementDrafts([
+      buildRawAliasArrangementDraft(
+        latestMessage,
+        sourceSummary,
+        unknownAlias,
+        guessAliasMeaningFromArrangements(
+          latestMessage,
+          getInitialArrangements()
+        )
+      ),
+    ]);
+    setPendingArrangementDrafts(getPendingArrangementDrafts());
+    handledIds.add(latestMessage.id);
+    persistAliasLearningHandledMessageIds(handledIds);
+  }, [
+    chatAliases,
+    testIdentities,
+    testMessages,
+    testConversationSummaries,
+  ]);
+
   const openHomeMessagePreview = React.useCallback(() => {
     if (!homeMessagePreview) return;
 
@@ -1047,6 +1589,194 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     markTestConversationAsRead(summary.conversationId);
     setTestConversationTargetUid(`test-${reply.id}`);
   }, [markTestConversationAsRead]);
+
+  const confirmChatArrangementDraft = React.useCallback(
+    (draft: PendingArrangementDraft) => {
+      const now = Date.now();
+      const locationName = draft.locationName.trim() || draft.locationText.trim();
+      const sourceLabel =
+        draft.sourceType === "unknown_alias_arrangement"
+          ? "未知暗语识别"
+          : draft.source === "ai_group_chat"
+          ? "AI 群聊识别"
+          : draft.source === "rules"
+            ? "规则识别"
+            : "AI 私聊识别";
+      const arrangement: ArrangementItem = {
+        id: `chat-arrangement-${now}`,
+        title: draft.title,
+        timeText: draft.timeText,
+        dateKey: draft.dateKey,
+        startTime: draft.startTime,
+        endTime: draft.endTime,
+        timeKind: draft.dateKey ? draft.timeKind : "none",
+        peopleText: draft.peopleText,
+        locationText: locationName,
+        locationName,
+        note: draft.note,
+        source: sourceLabel,
+        status: "pending",
+        createdAt: now,
+        pinned: false,
+        contexts: draft.contexts,
+        sourceConversationId: draft.sourceConversationId,
+        sourceConversationType: draft.sourceConversationType,
+        sourceMessageIds: draft.sourceMessageIds,
+        sourceType: draft.sourceType,
+        unknownAliasText: draft.unknownAliasText,
+        suggestedAliasMeaning: draft.suggestedAliasMeaning,
+        aliasLearningStatus: draft.suggestedAliasMeaning
+          ? "confirmed"
+          : draft.aliasLearningStatus,
+      };
+
+      const aliasText = draft.unknownAliasText?.trim() ?? "";
+      const aliasMeaning = draft.suggestedAliasMeaning?.trim() ?? "";
+      if (
+        draft.sourceType === "unknown_alias_arrangement" &&
+        draft.sourceConversationId &&
+        aliasText &&
+        aliasMeaning
+      ) {
+        const nextAlias: ChatAliasEntry = {
+          id: `learned-alias-${now}`,
+          conversationId: draft.sourceConversationId,
+          conversationType: draft.sourceConversationType ?? "private",
+          alias: aliasText,
+          meaning: aliasMeaning,
+          scope: "conversation",
+          sourceMessageIds: draft.sourceMessageIds ?? [],
+          sourceSummary: draft.contexts[0] ?? "",
+          createdAt: now,
+          updatedAt: now,
+        };
+        const nextAliases = [
+          nextAlias,
+          ...getInitialChatAliases().filter(
+            (alias) =>
+              !(
+                alias.conversationId === nextAlias.conversationId &&
+                alias.conversationType === nextAlias.conversationType &&
+                alias.alias === nextAlias.alias
+              )
+          ),
+        ];
+        setChatAliases(nextAliases);
+        persistChatAliases(nextAliases);
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new Event(chatAliasMapStorageEvent));
+        }
+      }
+
+      appendArrangement(arrangement);
+      removePendingArrangementDraft(draft.id);
+      setPendingArrangementDrafts(getPendingArrangementDrafts());
+    },
+    []
+  );
+
+  const dismissChatArrangementDraft = React.useCallback((draftId: string) => {
+    removePendingArrangementDraft(draftId);
+    setPendingArrangementDrafts(getPendingArrangementDrafts());
+  }, []);
+
+  const publishAliasLearningConfirmations = React.useCallback(
+    (confirmations: AliasLearningConfirmation[]) => {
+      setAliasLearningConfirmations(confirmations);
+      persistAliasLearningConfirmations(confirmations);
+    },
+    []
+  );
+
+  const rememberAliasLearningHandled = React.useCallback(
+    (sourceMessageIds: string[]) => {
+      const handledIds = getAliasLearningHandledMessageIds();
+      sourceMessageIds.forEach((id) => handledIds.add(id));
+      persistAliasLearningHandledMessageIds(handledIds);
+    },
+    []
+  );
+
+  const removeAliasLearningConfirmation = React.useCallback(
+    (confirmation: AliasLearningConfirmation) => {
+      publishAliasLearningConfirmations(
+        getInitialAliasLearningConfirmations().filter(
+          (item) => item.id !== confirmation.id
+        )
+      );
+    },
+    [publishAliasLearningConfirmations]
+  );
+
+  const confirmAliasLearning = React.useCallback(
+    (
+      confirmation: AliasLearningConfirmation,
+      meaning: string,
+      scope: "conversation" | "contact" | "global"
+    ) => {
+      const now = Date.now();
+      const nextAlias: ChatAliasEntry = {
+        id: `learned-alias-${now}`,
+        conversationId: confirmation.conversationId,
+        conversationType: confirmation.conversationType,
+        alias: confirmation.alias,
+        meaning,
+        scope,
+        sourceMessageIds: confirmation.sourceMessageIds,
+        sourceSummary: confirmation.sourceSummary,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const nextAliases = [
+        nextAlias,
+        ...getInitialChatAliases().filter(
+          (alias) =>
+            !(
+              alias.conversationId === nextAlias.conversationId &&
+              alias.conversationType === nextAlias.conversationType &&
+              alias.alias === nextAlias.alias
+            )
+        ),
+      ];
+      setChatAliases(nextAliases);
+      persistChatAliases(nextAliases);
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event(chatAliasMapStorageEvent));
+      }
+      rememberAliasLearningHandled(confirmation.sourceMessageIds);
+      removeAliasLearningConfirmation(confirmation);
+    },
+    [rememberAliasLearningHandled, removeAliasLearningConfirmation]
+  );
+
+  const ignoreAliasLearning = React.useCallback(
+    (confirmation: AliasLearningConfirmation) => {
+      rememberAliasLearningHandled(confirmation.sourceMessageIds);
+      removeAliasLearningConfirmation(confirmation);
+    },
+    [rememberAliasLearningHandled, removeAliasLearningConfirmation]
+  );
+
+  const continueAliasAsRawArrangement = React.useCallback(
+    (confirmation: AliasLearningConfirmation) => {
+      const sourceMessage = testMessages.find((message) =>
+        confirmation.sourceMessageIds.includes(message.id)
+      );
+      if (sourceMessage) {
+        appendPendingArrangementDrafts([
+          buildRawAliasArrangementDraft(sourceMessage, confirmation.sourceSummary),
+        ]);
+        setPendingArrangementDrafts(getPendingArrangementDrafts());
+      }
+      rememberAliasLearningHandled(confirmation.sourceMessageIds);
+      removeAliasLearningConfirmation(confirmation);
+    },
+    [
+      rememberAliasLearningHandled,
+      removeAliasLearningConfirmation,
+      testMessages,
+    ]
+  );
 
   const openSourceConversation = React.useCallback(
     (source: RecordSourceConversation) => {
@@ -1105,12 +1835,22 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <AiApiSettingsScreen onBack={() => setSettingsView("settings")} />;
     }
 
+    if (settingsView === "aliases") {
+      return (
+        <AliasSettingsScreen
+          summaries={testConversationSummaries}
+          onBack={() => setSettingsView("settings")}
+        />
+      );
+    }
+
     if (settingsView === "settings") {
       return (
         <SettingsScreen
           onBack={() => setSettingsView(null)}
           onOpenAppearance={() => setSettingsView("appearance")}
           onOpenAiApi={() => setSettingsView("aiApi")}
+          onOpenAliases={() => setSettingsView("aliases")}
         />
       );
     }
@@ -1140,6 +1880,12 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     }
 
     if (showTestConversation && activeTestConversationSummary) {
+      const chatArrangementDrafts = pendingArrangementDrafts.filter(
+        (draft) =>
+          draft.sourceConversationId ===
+            activeTestConversationSummary.conversationId &&
+          draft.sourceConversationType === activeTestConversationSummary.conversationType
+      );
       return (
         <TestIdentityConversationChat
           summary={activeTestConversationSummary}
@@ -1148,6 +1894,13 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
           onOpenRecordDetail={setRecordDetail}
           onOpenRecordSnapshot={setRecordSnapshot}
           onCreateReply={(content) => createTestReply(activeTestConversationSummary, content)}
+          arrangementDrafts={chatArrangementDrafts}
+          onConfirmArrangementDraft={confirmChatArrangementDraft}
+          onDismissArrangementDraft={dismissChatArrangementDraft}
+          aliasLearningConfirmation={null}
+          onConfirmAliasLearning={confirmAliasLearning}
+          onIgnoreAliasLearning={ignoreAliasLearning}
+          onContinueAliasAsRawArrangement={continueAliasAsRawArrangement}
         />
       );
     }
@@ -2452,6 +3205,118 @@ function SendToSelfConversationChat({
   );
 }
 
+function AliasLearningConfirmationCard({
+  confirmation,
+  onConfirm,
+  onIgnore,
+  onContinueRaw,
+}: {
+  confirmation: AliasLearningConfirmation;
+  onConfirm: (
+    confirmation: AliasLearningConfirmation,
+    meaning: string,
+    scope: "conversation" | "contact" | "global"
+  ) => void;
+  onIgnore: (confirmation: AliasLearningConfirmation) => void;
+  onContinueRaw: (confirmation: AliasLearningConfirmation) => void;
+}) {
+  const [selectedMeaning, setSelectedMeaning] = React.useState(
+    confirmation.candidates[0]?.meaning ?? ""
+  );
+  const [scope, setScope] = React.useState<"conversation" | "contact" | "global">(
+    confirmation.defaultScope
+  );
+
+  React.useEffect(() => {
+    setSelectedMeaning(confirmation.candidates[0]?.meaning ?? "");
+    setScope(confirmation.defaultScope);
+  }, [confirmation]);
+
+  const isQuestionAnswer = confirmation.mode === "qa";
+  const title = isQuestionAnswer
+    ? `学习 ${confirmation.alias} = ${selectedMeaning || "这个含义"}？`
+    : `${confirmation.alias} 是不是指 ${selectedMeaning || "这个安排"}？`;
+
+  return (
+    <div className="rounded-[14px] border border-primary/20 bg-surface px-3 py-2.5 text-left shadow-[0_8px_24px_rgba(15,23,42,0.08)] dark:shadow-[0_10px_28px_rgba(0,0,0,0.28)]">
+      <div className="flex items-start gap-2.5">
+        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary-soft text-[13px] font-semibold text-primary">
+          ~
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[14px] font-medium leading-5 text-text">{title}</p>
+          {confirmation.candidates.length > 1 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {confirmation.candidates.map((candidate) => (
+                <button
+                  key={`${candidate.meaning}-${candidate.arrangementId ?? ""}`}
+                  type="button"
+                  className={cn(
+                    "rounded-full px-2.5 py-1 text-[12px] leading-4 transition active:scale-[0.97]",
+                    selectedMeaning === candidate.meaning
+                      ? "bg-primary text-on-primary"
+                      : "bg-fill-2 text-text-muted"
+                  )}
+                  onClick={() => setSelectedMeaning(candidate.meaning)}
+                >
+                  {candidate.meaning}
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="mt-2 flex items-center gap-1.5">
+            <span className="text-[11px] leading-4 text-text-tertiary">范围</span>
+            {(
+              [
+                ["conversation", "当前聊天"],
+                ["contact", "当前联系人"],
+                ["global", "全局"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                className={cn(
+                  "rounded-full px-2 py-1 text-[11px] leading-3 transition active:scale-[0.97]",
+                  scope === value ? "bg-primary-soft text-primary" : "bg-fill-2 text-text-muted"
+                )}
+                onClick={() => setScope(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="rounded-full bg-primary px-3 py-1.5 text-[12px] font-medium leading-4 text-on-primary transition active:scale-[0.97]"
+              onClick={() => {
+                if (selectedMeaning) onConfirm(confirmation, selectedMeaning, scope);
+              }}
+            >
+              确认保存
+            </button>
+            <button
+              type="button"
+              className="rounded-full bg-fill-2 px-3 py-1.5 text-[12px] font-medium leading-4 text-text-muted transition active:scale-[0.97]"
+              onClick={() => onContinueRaw(confirmation)}
+            >
+              按原文安排
+            </button>
+            <button
+              type="button"
+              className="rounded-full bg-fill-2 px-3 py-1.5 text-[12px] font-medium leading-4 text-text-muted transition active:scale-[0.97]"
+              onClick={() => onIgnore(confirmation)}
+            >
+              忽略
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TestIdentityConversationChat({
   summary,
   targetUid,
@@ -2459,6 +3324,13 @@ function TestIdentityConversationChat({
   onOpenRecordDetail,
   onOpenRecordSnapshot,
   onCreateReply,
+  arrangementDrafts,
+  onConfirmArrangementDraft,
+  onDismissArrangementDraft,
+  aliasLearningConfirmation,
+  onConfirmAliasLearning,
+  onIgnoreAliasLearning,
+  onContinueAliasAsRawArrangement,
 }: {
   summary: TestConversationSummary;
   targetUid?: string | null;
@@ -2466,6 +3338,19 @@ function TestIdentityConversationChat({
   onOpenRecordDetail: (record: RecordItem) => void;
   onOpenRecordSnapshot: (record: RecordItem) => void;
   onCreateReply: (content: string) => void;
+  arrangementDrafts: PendingArrangementDraft[];
+  onConfirmArrangementDraft: (draft: PendingArrangementDraft) => void;
+  onDismissArrangementDraft: (draftId: string) => void;
+  aliasLearningConfirmation: AliasLearningConfirmation | null;
+  onConfirmAliasLearning: (
+    confirmation: AliasLearningConfirmation,
+    meaning: string,
+    scope: "conversation" | "contact" | "global"
+  ) => void;
+  onIgnoreAliasLearning: (confirmation: AliasLearningConfirmation) => void;
+  onContinueAliasAsRawArrangement: (
+    confirmation: AliasLearningConfirmation
+  ) => void;
 }) {
   const { resolvedLocale, t } = usePreferences();
   const candidateProfile = useCandidateProfile();
@@ -2514,6 +3399,28 @@ function TestIdentityConversationChat({
           </div>
         </div>
       </header>
+
+      {aliasLearningConfirmation && (
+        <div className="shrink-0 bg-bg px-4 pb-2 pt-3">
+          <AliasLearningConfirmationCard
+            confirmation={aliasLearningConfirmation}
+            onConfirm={onConfirmAliasLearning}
+            onIgnore={onIgnoreAliasLearning}
+            onContinueRaw={onContinueAliasAsRawArrangement}
+          />
+        </div>
+      )}
+
+      {arrangementDrafts.length > 0 && (
+        <div className="shrink-0 bg-bg px-4 pb-2 pt-3">
+          <ChatArrangementDraftToast
+            draft={arrangementDrafts[0]}
+            queueCount={arrangementDrafts.length}
+            onConfirm={onConfirmArrangementDraft}
+            onDismiss={() => onDismissArrangementDraft(arrangementDrafts[0].id)}
+          />
+        </div>
+      )}
 
       <div
         ref={scrollContainerRef}
@@ -2603,6 +3510,299 @@ function TestIdentityConversationChat({
       />
     </div>
   );
+}
+
+function ChatArrangementDraftToast({
+  draft,
+  queueCount,
+  onConfirm,
+  onDismiss,
+}: {
+  draft: PendingArrangementDraft;
+  queueCount: number;
+  onConfirm: (draft: PendingArrangementDraft) => void;
+  onDismiss: () => void;
+}) {
+  const [isEditing, setIsEditing] = React.useState(false);
+  const [isDialogOpen, setIsDialogOpen] = React.useState(false);
+  const [editDraft, setEditDraft] = React.useState(draft);
+  const sourceSummary = buildArrangementDraftSourceSummary(draft);
+  const isUnknownAliasArrangement =
+    draft.sourceType === "unknown_alias_arrangement";
+  const possibleArrangementText = [draft.timeText, draft.title]
+    .filter(Boolean)
+    .join("");
+  const confidenceLabel =
+    draft.confidence > 0
+      ? `置信度 ${Math.round(draft.confidence * 100)}%`
+      : "AI 已识别到安排";
+
+  React.useEffect(() => {
+    setEditDraft(draft);
+    setIsEditing(false);
+    setIsDialogOpen(false);
+  }, [draft]);
+
+  const updateEditDraft = (key: keyof PendingArrangementDraft, value: string) => {
+    setEditDraft((current) => ({ ...current, [key]: value }));
+  };
+
+  const confirmEditedDraft = () => {
+    const title = editDraft.title.trim();
+    if (!title) return;
+
+    onConfirm({
+      ...editDraft,
+      title,
+      timeText: editDraft.timeText.trim(),
+      locationText: editDraft.locationText.trim(),
+      locationName: editDraft.locationName.trim() || editDraft.locationText.trim(),
+      note: editDraft.note.trim(),
+      unknownAliasText: editDraft.unknownAliasText?.trim() ?? "",
+      suggestedAliasMeaning: editDraft.suggestedAliasMeaning?.trim() ?? "",
+      aliasLearningStatus: editDraft.suggestedAliasMeaning?.trim()
+        ? "suggested"
+        : editDraft.aliasLearningStatus,
+    });
+  };
+
+  const openConfirmDialog = () => {
+    setEditDraft(draft);
+    setIsDialogOpen(true);
+  };
+
+  return (
+    <>
+      <div className="rounded-[16px] border border-primary/20 bg-surface px-3 py-2.5 text-left shadow-[0_8px_24px_rgba(15,23,42,0.08)] dark:shadow-[0_10px_28px_rgba(0,0,0,0.28)]">
+        <div className="flex items-start gap-2.5">
+          <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary-soft text-[15px] text-primary">
+            ✓
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <p className="truncate text-[14px] font-medium leading-5 text-text">
+                {isUnknownAliasArrangement
+                  ? `检测到可能的安排：${possibleArrangementText || draft.title}`
+                  : queueCount > 1
+                    ? `发现 ${queueCount} 个安排`
+                    : "识别到安排"}
+              </p>
+              {!isUnknownAliasArrangement && (
+                <span className="shrink-0 rounded-full bg-primary-soft px-2 py-[2px] text-[10px] font-medium leading-3 text-primary">
+                  {confidenceLabel}
+                </span>
+              )}
+            </div>
+
+            {isEditing && !isUnknownAliasArrangement ? (
+              <div className="mt-2 space-y-2">
+              <input
+                className="h-9 w-full rounded-[10px] border border-border-light bg-bg px-3 text-[13px] leading-5 text-text outline-none focus:border-primary"
+                value={editDraft.title}
+                onChange={(event) => updateEditDraft("title", event.target.value)}
+                placeholder="安排标题"
+              />
+              <input
+                className="h-9 w-full rounded-[10px] border border-border-light bg-bg px-3 text-[13px] leading-5 text-text outline-none focus:border-primary"
+                value={editDraft.timeText}
+                onChange={(event) => updateEditDraft("timeText", event.target.value)}
+                placeholder="时间"
+              />
+              <input
+                className="h-9 w-full rounded-[10px] border border-border-light bg-bg px-3 text-[13px] leading-5 text-text outline-none focus:border-primary"
+                value={editDraft.locationName || editDraft.locationText}
+                onChange={(event) => {
+                  updateEditDraft("locationName", event.target.value);
+                  updateEditDraft("locationText", event.target.value);
+                }}
+                placeholder="地点"
+              />
+              <textarea
+                className="min-h-[64px] w-full resize-none rounded-[10px] border border-border-light bg-bg px-3 py-2 text-[13px] leading-5 text-text outline-none focus:border-primary"
+                value={editDraft.note}
+                onChange={(event) => updateEditDraft("note", event.target.value)}
+                placeholder="备注"
+              />
+            </div>
+          ) : (
+            <div className="mt-1 space-y-1">
+              {!isUnknownAliasArrangement && (
+                <p className="line-clamp-2 text-[13px] leading-5 text-text">
+                  {draft.title}
+                </p>
+              )}
+              {!isUnknownAliasArrangement && (
+                <ArrangementDraftMeta label="时间" value={draft.timeText} />
+              )}
+              <ArrangementDraftMeta
+                label="地点"
+                value={draft.locationName || draft.locationText}
+              />
+              {!isUnknownAliasArrangement && (
+                <ArrangementDraftMeta label="来源" value={sourceSummary} />
+              )}
+            </div>
+          )}
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              type="button"
+              className="rounded-full bg-primary px-3 py-1.5 text-[12px] font-medium leading-4 text-on-primary transition active:scale-[0.97]"
+              onClick={isUnknownAliasArrangement ? openConfirmDialog : confirmEditedDraft}
+            >
+              {isEditing ? "保存并添加" : "确认添加"}
+            </button>
+            {!isEditing && (
+              <button
+                type="button"
+                className="rounded-full bg-fill-2 px-3 py-1.5 text-[12px] font-medium leading-4 text-text-muted transition active:scale-[0.97]"
+                onClick={isUnknownAliasArrangement ? openConfirmDialog : () => setIsEditing(true)}
+              >
+                编辑
+              </button>
+            )}
+            {isEditing && (
+              <button
+                type="button"
+                className="rounded-full bg-fill-2 px-3 py-1.5 text-[12px] font-medium leading-4 text-text-muted transition active:scale-[0.97]"
+                onClick={() => {
+                  setEditDraft(draft);
+                  setIsEditing(false);
+                }}
+              >
+                取消
+              </button>
+            )}
+            <button
+              type="button"
+              className="rounded-full bg-fill-2 px-3 py-1.5 text-[12px] font-medium leading-4 text-text-muted transition active:scale-[0.97]"
+              onClick={onDismiss}
+            >
+              忽略
+            </button>
+          </div>
+        </div>
+      </div>
+      </div>
+
+      {isUnknownAliasArrangement && isDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-[rgba(15,23,42,0.32)] px-4 pb-4 pt-12 backdrop-blur-[2px]">
+          <div className="w-full max-w-[390px] rounded-[18px] bg-bg p-4 shadow-[0_20px_60px_rgba(15,23,42,0.24)]">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[16px] font-semibold leading-6 text-text">
+                  确认暗语与安排
+                </p>
+                <p className="mt-1 text-[12px] leading-5 text-text-tertiary">
+                  {`检测到可能的安排：${possibleArrangementText || draft.title}`}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="rounded-full bg-fill-2 px-3 py-1.5 text-[12px] font-medium text-text-muted"
+                onClick={() => {
+                  setEditDraft(draft);
+                  setIsDialogOpen(false);
+                }}
+              >
+                关闭
+              </button>
+            </div>
+            <div className="mt-3 space-y-2">
+              <input
+                className="h-10 w-full rounded-[10px] border border-border-light bg-surface px-3 text-[14px] text-text outline-none focus:border-primary"
+                value={editDraft.title}
+                onChange={(event) => updateEditDraft("title", event.target.value)}
+                placeholder="安排标题"
+              />
+              <input
+                className="h-10 w-full rounded-[10px] border border-border-light bg-surface px-3 text-[14px] text-text outline-none focus:border-primary"
+                value={editDraft.timeText}
+                onChange={(event) => updateEditDraft("timeText", event.target.value)}
+                placeholder="时间"
+              />
+              <input
+                className="h-10 w-full rounded-[10px] border border-border-light bg-surface px-3 text-[14px] text-text outline-none focus:border-primary"
+                value={editDraft.locationName || editDraft.locationText}
+                onChange={(event) => {
+                  updateEditDraft("locationName", event.target.value);
+                  updateEditDraft("locationText", event.target.value);
+                }}
+                placeholder="地点"
+              />
+              <textarea
+                className="min-h-[62px] w-full resize-none rounded-[10px] border border-border-light bg-surface px-3 py-2 text-[14px] leading-5 text-text outline-none focus:border-primary"
+                value={editDraft.note}
+                onChange={(event) => updateEditDraft("note", event.target.value)}
+                placeholder="备注"
+              />
+              <label className="block text-[12px] leading-4 text-text-tertiary">
+                暗语
+                <input
+                  className="mt-1 h-10 w-full rounded-[10px] border border-border-light bg-surface px-3 text-[14px] text-text outline-none focus:border-primary"
+                  value={editDraft.unknownAliasText ?? ""}
+                  onChange={(event) =>
+                    updateEditDraft("unknownAliasText", event.target.value)
+                  }
+                  placeholder="例如：~~、老样子"
+                />
+              </label>
+              <label className="block text-[12px] leading-4 text-text-tertiary">
+                暗语含义
+                <input
+                  className="mt-1 h-10 w-full rounded-[10px] border border-border-light bg-surface px-3 text-[14px] text-text outline-none focus:border-primary"
+                  value={editDraft.suggestedAliasMeaning ?? ""}
+                  onChange={(event) =>
+                    updateEditDraft("suggestedAliasMeaning", event.target.value)
+                  }
+                  placeholder="可编辑暗语含义，如：游泳"
+                />
+              </label>
+            </div>
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                className="rounded-full bg-fill-2 px-4 py-2 text-[13px] font-medium text-text-muted"
+                onClick={() => onDismiss()}
+              >
+                忽略
+              </button>
+              <button
+                type="button"
+                className="rounded-full bg-primary px-4 py-2 text-[13px] font-semibold text-on-primary"
+                onClick={confirmEditedDraft}
+              >
+                确认添加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function ArrangementDraftMeta({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  if (!value.trim()) return null;
+
+  return (
+    <p className="truncate text-[11px] leading-4 text-text-muted">
+      <span className="text-text-tertiary">{label}：</span>
+      {value}
+    </p>
+  );
+}
+
+function buildArrangementDraftSourceSummary(draft: PendingArrangementDraft) {
+  const firstContext = draft.contexts[0]?.trim();
+  if (!firstContext) return "";
+
+  return firstContext.replace(/\s+/g, " ").slice(0, 42);
 }
 
 function shouldShowConversationTime(prevSendAt: number, currentSendAt: number) {
@@ -3188,10 +4388,12 @@ function MineActionCard({
 function SettingsScreen({
   onBack,
   onOpenAiApi,
+  onOpenAliases,
   onOpenAppearance,
 }: {
   onBack: () => void;
   onOpenAiApi: () => void;
+  onOpenAliases: () => void;
   onOpenAppearance: () => void;
 }) {
   const { localeCode, resolvedLocale, t } = usePreferences();
@@ -3218,6 +4420,11 @@ function SettingsScreen({
             onClick={onOpenAiApi}
           />
           <SettingsListItem
+            title="暗语管理"
+            description="为不同聊天配置老地方、开黑、补蓝等含义"
+            onClick={onOpenAliases}
+          />
+          <SettingsListItem
             title={t("settings.language")}
             description={`${t("settings.current")}：${
               localeCode === ""
@@ -3232,6 +4439,256 @@ function SettingsScreen({
       {showLanguageSheet && (
         <LanguageSheet onClose={() => setShowLanguageSheet(false)} />
       )}
+    </div>
+  );
+}
+
+function AliasSettingsScreen({
+  summaries,
+  onBack,
+}: {
+  summaries: TestConversationSummary[];
+  onBack: () => void;
+}) {
+  const [aliases, setAliases] = React.useState(getInitialChatAliases);
+  const [selectedConversationId, setSelectedConversationId] = React.useState(
+    summaries[0]?.conversationId ?? ""
+  );
+  const [aliasText, setAliasText] = React.useState("");
+  const [aliasMeaning, setAliasMeaning] = React.useState("");
+  const [editingAliasId, setEditingAliasId] = React.useState<string | null>(null);
+  const [message, setMessage] = React.useState("");
+
+  const selectedSummary =
+    summaries.find((summary) => summary.conversationId === selectedConversationId) ??
+    summaries[0] ??
+    null;
+  const visibleAliases = selectedSummary
+    ? aliases
+        .filter(
+          (alias) =>
+            alias.conversationId === selectedSummary.conversationId &&
+            alias.conversationType === selectedSummary.conversationType
+        )
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+    : [];
+  const canSave = Boolean(aliasText.trim() && aliasMeaning.trim() && selectedSummary);
+
+  React.useEffect(() => {
+    if (!selectedConversationId && summaries[0]) {
+      setSelectedConversationId(summaries[0].conversationId);
+    }
+  }, [selectedConversationId, summaries]);
+
+  const resetForm = () => {
+    setAliasText("");
+    setAliasMeaning("");
+    setEditingAliasId(null);
+  };
+
+  const saveAliases = (nextAliases: ChatAliasEntry[]) => {
+    setAliases(nextAliases);
+    persistChatAliases(nextAliases);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event("storage"));
+      window.dispatchEvent(new Event(chatAliasMapStorageEvent));
+    }
+  };
+
+  const handleSave = () => {
+    if (!selectedSummary) {
+      setMessage("请先选择一个聊天");
+      return;
+    }
+
+    const alias = aliasText.trim();
+    const meaning = aliasMeaning.trim();
+    if (!alias || !meaning) {
+      setMessage("请填写暗语和真实含义");
+      return;
+    }
+
+    const now = Date.now();
+    const existingAlias = aliases.find((item) => item.id === editingAliasId);
+    const nextAlias: ChatAliasEntry = {
+      id: editingAliasId ?? `app-alias-${now}`,
+      conversationId: selectedSummary.conversationId,
+      conversationType: selectedSummary.conversationType,
+      alias,
+      meaning,
+      scope: existingAlias?.scope ?? "conversation",
+      sourceMessageIds: existingAlias?.sourceMessageIds ?? [],
+      sourceSummary: existingAlias?.sourceSummary ?? "",
+      createdAt: existingAlias?.createdAt ?? now,
+      updatedAt: now,
+    };
+    const nextAliases = editingAliasId
+      ? aliases.map((item) => (item.id === editingAliasId ? nextAlias : item))
+      : [
+          nextAlias,
+          ...aliases.filter(
+            (item) =>
+              item.conversationId !== selectedSummary.conversationId ||
+              item.alias !== alias
+          ),
+        ];
+
+    saveAliases(nextAliases);
+    resetForm();
+    setMessage(editingAliasId ? "暗语已更新" : "暗语已绑定");
+  };
+
+  const handleEdit = (alias: ChatAliasEntry) => {
+    setSelectedConversationId(alias.conversationId);
+    setAliasText(alias.alias);
+    setAliasMeaning(alias.meaning);
+    setEditingAliasId(alias.id);
+    setMessage("");
+  };
+
+  const handleDelete = (aliasId: string) => {
+    saveAliases(aliases.filter((alias) => alias.id !== aliasId));
+    if (editingAliasId === aliasId) {
+      resetForm();
+    }
+    setMessage("暗语已删除");
+  };
+
+  return (
+    <div className="flex h-full flex-col bg-bg">
+      <MobilePageHeader title="暗语管理" onBack={onBack} />
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+        <section className="border-b border-border-light pb-4">
+          <label className="block text-xs font-medium leading-4 text-text-tertiary">
+            生效聊天
+          </label>
+          <select
+            value={selectedSummary?.conversationId ?? ""}
+            onChange={(event) => {
+              setSelectedConversationId(event.target.value);
+              resetForm();
+              setMessage("");
+            }}
+            className="mt-2 h-11 w-full rounded-[8px] border border-border bg-surface px-3 text-[15px] leading-5 text-text outline-none focus:border-primary"
+          >
+            {summaries.map((summary) => (
+              <option key={summary.conversationId} value={summary.conversationId}>
+                {summary.conversationType === "group" ? "群聊" : "私聊"} · {summary.title}
+              </option>
+            ))}
+          </select>
+          <p className="mt-2 text-xs leading-5 text-text-tertiary">
+            暗语只对所选聊天生效，避免把同一句话误判到其他上下文。
+          </p>
+        </section>
+
+        <section className="border-b border-border-light py-4">
+          <div className="space-y-3">
+            <label className="block">
+              <span className="text-xs font-medium leading-4 text-text-tertiary">
+                暗语
+              </span>
+              <input
+                value={aliasText}
+                onChange={(event) => setAliasText(event.target.value)}
+                placeholder="例如：老地方"
+                className="mt-2 h-11 w-full rounded-[8px] border border-border bg-surface px-3 text-[15px] leading-5 text-text outline-none placeholder:text-text-disabled focus:border-primary"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium leading-4 text-text-tertiary">
+                真实含义
+              </span>
+              <input
+                value={aliasMeaning}
+                onChange={(event) => setAliasMeaning(event.target.value)}
+                placeholder="例如：学校门口奶茶店"
+                className="mt-2 h-11 w-full rounded-[8px] border border-border bg-surface px-3 text-[15px] leading-5 text-text outline-none placeholder:text-text-disabled focus:border-primary"
+              />
+            </label>
+          </div>
+
+          <div className="mt-4 flex gap-2">
+            <button
+              type="button"
+              disabled={!canSave}
+              onClick={handleSave}
+              className={cn(
+                "h-10 flex-1 rounded-full text-sm font-semibold transition active:scale-[0.98]",
+                canSave
+                  ? "bg-primary text-primary-foreground"
+                  : "bg-surface-pressed text-text-disabled"
+              )}
+            >
+              {editingAliasId ? "保存修改" : "绑定暗语"}
+            </button>
+            {editingAliasId && (
+              <button
+                type="button"
+                onClick={() => {
+                  resetForm();
+                  setMessage("");
+                }}
+                className="h-10 rounded-full bg-surface px-4 text-sm font-medium text-text-muted transition active:scale-[0.98]"
+              >
+                取消
+              </button>
+            )}
+          </div>
+          {message && <p className="mt-3 text-xs leading-5 text-primary">{message}</p>}
+        </section>
+
+        <section className="py-4">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-[15px] font-semibold leading-5 text-text">
+              已绑定暗语
+            </h2>
+            <span className="text-xs leading-4 text-text-tertiary">
+              {visibleAliases.length} 条
+            </span>
+          </div>
+
+          {visibleAliases.length === 0 ? (
+            <div className="py-8 text-center text-sm leading-6 text-text-tertiary">
+              当前聊天还没有暗语
+            </div>
+          ) : (
+            <div className="divide-y divide-border-light">
+              {visibleAliases.map((alias) => (
+                <div key={alias.id} className="py-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[15px] font-medium leading-5 text-text">
+                        {alias.alias}
+                      </p>
+                      <p className="mt-1 text-sm leading-5 text-text-tertiary">
+                        {alias.meaning}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleEdit(alias)}
+                        className="h-8 rounded-full bg-surface px-3 text-xs font-medium text-text-muted"
+                      >
+                        修改
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDelete(alias.id)}
+                        className="h-8 rounded-full bg-surface px-3 text-xs font-medium text-danger"
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
     </div>
   );
 }

@@ -1,11 +1,20 @@
 import React from "react";
 import {
-  recognizeArrangementFromGroupChat,
-  recognizeArrangementFromPrivateChat,
+  judgeArrangementIntentFromChat,
+  type ArrangementUpdatePatch,
+  type ArrangementJudgeAction,
+  type ArrangementJudgeInput,
+  type ArrangementJudgeMessage,
 } from "@/ai/aiArrangementRecognition";
 import { AiApiError, callAiJson } from "@/ai/aiClient";
 import {
-  appendPendingArrangementDrafts,
+  appendArrangement,
+  arrangementStorageEvent,
+  getInitialArrangements,
+  persistArrangements,
+  type ArrangementDraft,
+  type ArrangementItem,
+  type ArrangementTimeKind,
 } from "@/arrangements/arrangementStorage";
 import {
   createTestGroup,
@@ -36,6 +45,14 @@ const pushedPrivateRecognitionMessageIdsStorageKey =
   "arkme-demo.pushedPrivateRecognitionMessageIds";
 const pushedGroupRecognitionMessageIdsStorageKey =
   "arkme-demo.pushedGroupRecognitionMessageIds";
+const chatArrangementConfirmationsStorageKey =
+  "arkme-demo.chatArrangementConfirmations";
+const activeConversationIntentsStorageKey =
+  "arkme-demo.activeConversationIntents";
+const chatAliasMapStorageKey = "arkme-demo.chatAliasMap";
+const chatAliasMapStorageEvent = "arkme-demo.chatAliasMap.updated";
+const arrangementUpdateUndoMs = 6000;
+const ambiguousUpdateGapThreshold = 0.12;
 const aiTestPrompt =
   "请返回一个 JSON 对象，用于验证 AI API 调用是否正常。字段包括 summary、status、nextStep。summary 用一句中文说明连接正常。";
 
@@ -51,6 +68,100 @@ type AutoRecognitionStatus =
   | { status: "success"; message: string }
   | { status: "info"; message: string }
   | { status: "error"; message: string };
+
+type ChatArrangementConfirmation = ArrangementDraft & {
+  id: string;
+  confidence: number;
+  contexts: string[];
+  source: "ai" | "rules" | "ai_group_chat";
+  sourceConversationId: string;
+  sourceConversationType: TestConversationType;
+  sourceMessageIds: string[];
+  sourceSummary: string;
+  createdAt: number;
+  sourceType?: "unknown_alias_arrangement";
+  unknownAliasText?: string;
+  suggestedAliasMeaning?: string;
+  aliasLearningStatus?: "suggested" | "confirmed";
+  aiActionType?: "new_arrangement" | "unknown_symbol_arrangement";
+  aiReason?: string;
+  candidateReason?: string;
+  candidateArrangementIds?: string[];
+};
+
+type ArrangementDraftWithRecognitionMeta = ArrangementDraft & {
+  confidence: number;
+  contexts: string[];
+  source: "ai" | "rules" | "ai_group_chat";
+  sourceType?: "unknown_alias_arrangement";
+  unknownAliasText?: string;
+  suggestedAliasMeaning?: string;
+  aliasLearningStatus?: "suggested" | "confirmed";
+  aiActionType?: "new_arrangement" | "unknown_symbol_arrangement";
+  aiReason?: string;
+  candidateReason?: string;
+  candidateArrangementIds?: string[];
+};
+
+type ArrangementUpdateToast = {
+  itemTitle: string;
+  previousItems: ArrangementItem[];
+};
+
+type ActiveConversationIntent = {
+  conversationId: string;
+  conversationType: TestConversationType;
+  arrangementId: string;
+  topic: string;
+  participantIds: string[];
+  sourceMessageIds: string[];
+  updatedAt: number;
+};
+
+type ScoredArrangementCandidate = {
+  arrangement: ArrangementItem;
+  score: number;
+  reasons: string[];
+};
+
+type AmbiguousArrangementUpdate = {
+  patch: ArrangementUpdatePatch;
+  candidates: ScoredArrangementCandidate[];
+  sourceMessageIds: string[];
+  conversationType: TestConversationType;
+  aiReason?: string;
+};
+
+type AliasCandidateConfirmation = {
+  id: string;
+  conversationId: string;
+  conversationType: TestConversationType;
+  aliasText: string;
+  aliasMeaning: string;
+  confidence: number;
+  reason: string;
+  sourceMessageIds: string[];
+  sourceSummary: string;
+};
+
+type ChatAliasEntry = {
+  id: string;
+  conversationId: string;
+  conversationType: TestConversationType;
+  alias: string;
+  meaning: string;
+  scope?: "conversation" | "contact" | "global";
+  sourceMessageIds?: string[];
+  sourceSummary?: string;
+  createdAt?: number;
+  updatedAt: number;
+};
+
+type RecalledRecognitionCandidate = {
+  currentMessage: TestMessage;
+  messages: TestMessage[];
+  reasons: string[];
+};
 
 function getInitialAdminMessageMode(): TestConversationType {
   if (typeof window === "undefined") return "private";
@@ -153,6 +264,342 @@ function markGroupRecognitionMessagesPushed(messageIds: string[]) {
   ]);
 }
 
+function normalizeText(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeConfidence(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.min(1, value))
+    : 0;
+}
+
+function normalizeTimeKind(value: unknown): ArrangementTimeKind {
+  if (value === "allDay" || value === "time" || value === "timeRange") {
+    return value;
+  }
+
+  return "none";
+}
+
+function normalizeStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function normalizeChatArrangementConfirmation(
+  value: unknown
+): ChatArrangementConfirmation | null {
+  if (!value || typeof value !== "object") return null;
+
+  const item = value as Partial<ChatArrangementConfirmation>;
+  const id = normalizeText(item.id);
+  const title = normalizeText(item.title);
+  const sourceConversationId = normalizeText(item.sourceConversationId);
+  if (!id || !title || !sourceConversationId) return null;
+  const locationText = normalizeText(item.locationText);
+  const locationName = normalizeText(item.locationName) || locationText;
+
+  return {
+    id,
+    title,
+    timeText: normalizeText(item.timeText),
+    dateKey: normalizeText(item.dateKey),
+    startTime: normalizeText(item.startTime),
+    endTime: normalizeText(item.endTime),
+    timeKind: normalizeTimeKind(item.timeKind),
+    peopleText: normalizeText(item.peopleText),
+    locationText,
+    locationName,
+    note: normalizeText(item.note),
+    confidence: normalizeConfidence(item.confidence),
+    contexts: normalizeStringArray(item.contexts),
+    source:
+      item.source === "rules" || item.source === "ai_group_chat"
+        ? item.source
+        : "ai",
+    sourceConversationId,
+    sourceConversationType: item.sourceConversationType === "group" ? "group" : "private",
+    sourceMessageIds: normalizeStringArray(item.sourceMessageIds),
+    sourceSummary: normalizeText(item.sourceSummary),
+    sourceType:
+      item.sourceType === "unknown_alias_arrangement"
+        ? item.sourceType
+        : undefined,
+    unknownAliasText: normalizeText(item.unknownAliasText),
+    suggestedAliasMeaning: normalizeText(item.suggestedAliasMeaning),
+    aliasLearningStatus:
+      item.aliasLearningStatus === "confirmed" ||
+      item.aliasLearningStatus === "suggested"
+        ? item.aliasLearningStatus
+        : undefined,
+    aiActionType:
+      item.aiActionType === "new_arrangement" ||
+      item.aiActionType === "unknown_symbol_arrangement"
+        ? item.aiActionType
+        : undefined,
+    aiReason: normalizeText(item.aiReason),
+    candidateReason: normalizeText(item.candidateReason),
+    candidateArrangementIds: normalizeStringArray(item.candidateArrangementIds),
+    createdAt:
+      typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+        ? item.createdAt
+        : Date.now(),
+  };
+}
+
+function getInitialChatArrangementConfirmations() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(
+      chatArrangementConfirmationsStorageKey
+    );
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue
+          .map(normalizeChatArrangementConfirmation)
+          .filter((item): item is ChatArrangementConfirmation => Boolean(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistChatArrangementConfirmations(
+  confirmations: ChatArrangementConfirmation[]
+) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      chatArrangementConfirmationsStorageKey,
+      JSON.stringify(confirmations)
+    );
+  } catch {
+    // Confirmation cards are a convenience; keep message sending usable.
+  }
+}
+
+function normalizeActiveConversationIntent(
+  value: unknown
+): ActiveConversationIntent | null {
+  if (!value || typeof value !== "object") return null;
+
+  const item = value as Partial<ActiveConversationIntent>;
+  const conversationId = normalizeText(item.conversationId);
+  const arrangementId = normalizeText(item.arrangementId);
+  if (!conversationId || !arrangementId) return null;
+
+  return {
+    conversationId,
+    conversationType: item.conversationType === "group" ? "group" : "private",
+    arrangementId,
+    topic: normalizeText(item.topic),
+    participantIds: normalizeStringArray(item.participantIds),
+    sourceMessageIds: normalizeStringArray(item.sourceMessageIds),
+    updatedAt:
+      typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
+        ? item.updatedAt
+        : Date.now(),
+  };
+}
+
+function getInitialActiveConversationIntents() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(
+      activeConversationIntentsStorageKey
+    );
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue
+          .map(normalizeActiveConversationIntent)
+          .filter((item): item is ActiveConversationIntent => Boolean(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistActiveConversationIntents(intents: ActiveConversationIntent[]) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(
+      activeConversationIntentsStorageKey,
+      JSON.stringify(intents)
+    );
+  } catch {
+    // Intent memory is best-effort.
+  }
+}
+
+function normalizeChatAliasEntry(value: unknown): ChatAliasEntry | null {
+  if (!value || typeof value !== "object") return null;
+
+  const item = value as Partial<ChatAliasEntry>;
+  const id = normalizeText(item.id);
+  const conversationId = normalizeText(item.conversationId);
+  const alias = normalizeText(item.alias);
+  const meaning = normalizeText(item.meaning);
+  if (!id || !conversationId || !alias || !meaning) return null;
+
+  return {
+    id,
+    conversationId,
+    conversationType: item.conversationType === "group" ? "group" : "private",
+    alias,
+    meaning,
+    scope:
+      item.scope === "contact" || item.scope === "global"
+        ? item.scope
+        : "conversation",
+    sourceMessageIds: Array.isArray(item.sourceMessageIds)
+      ? item.sourceMessageIds.map(normalizeText).filter(Boolean)
+      : [],
+    sourceSummary: normalizeText(item.sourceSummary),
+    createdAt:
+      typeof item.createdAt === "number" && Number.isFinite(item.createdAt)
+        ? item.createdAt
+        : undefined,
+    updatedAt:
+      typeof item.updatedAt === "number" && Number.isFinite(item.updatedAt)
+        ? item.updatedAt
+        : Date.now(),
+  };
+}
+
+function getInitialChatAliases() {
+  if (typeof window === "undefined") return [];
+
+  try {
+    const storedValue = window.localStorage.getItem(chatAliasMapStorageKey);
+    const parsedValue = storedValue ? JSON.parse(storedValue) : [];
+    return Array.isArray(parsedValue)
+      ? parsedValue
+          .map(normalizeChatAliasEntry)
+          .filter((item): item is ChatAliasEntry => Boolean(item))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistChatAliases(aliases: ChatAliasEntry[]) {
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(chatAliasMapStorageKey, JSON.stringify(aliases));
+    window.dispatchEvent(new Event(chatAliasMapStorageEvent));
+  } catch {
+    // Alias settings are best-effort.
+  }
+}
+
+function buildRecognitionSourceSummary(
+  messages: TestMessage[],
+  identities: TestIdentity[]
+) {
+  return messages
+    .slice(-3)
+    .map((message) => {
+      const speaker =
+        message.sender === "demo"
+          ? "我"
+          : identities.find((identity) => identity.id === message.identityId)
+              ?.name ?? "对方";
+      return `${speaker}：${message.text}`;
+    })
+    .join(" / ");
+}
+
+function getMessageSpeaker(message: TestMessage, identities: TestIdentity[]) {
+  if (message.sender === "demo") return "我";
+  return (
+    identities.find((identity) => identity.id === message.identityId)?.name ??
+    (message.conversationType === "group" ? "群成员" : "对方")
+  );
+}
+
+function buildJudgeMessages(
+  messages: TestMessage[],
+  currentMessageId: string,
+  identities: TestIdentity[]
+): ArrangementJudgeMessage[] {
+  return messages.map((message) => ({
+    id: message.id,
+    sender: getMessageSpeaker(message, identities),
+    senderRole: message.sender === "demo" ? "me" : "other",
+    text: message.text,
+    sentAt: message.sentAt,
+    isCurrent: message.id === currentMessageId,
+  }));
+}
+
+function getRecallReasons(text: string, aliases: ChatAliasEntry[]) {
+  const reasons: string[] = [];
+  if (
+    /(今天|今晚|明天|后天|周[一二三四五六日天]|星期[一二三四五六日天]|早上|上午|中午|下午|晚上|今晚|[0-2]?\\d[:：点时])/.test(
+      text
+    )
+  ) {
+    reasons.push("time-word");
+  }
+  if (/(去|约|见|一起|安排|记得|提醒|帮|带|买|拿|处理|开会|会议|可以吗|要不要|能不能)/.test(text)) {
+    reasons.push("invitation-or-task-word");
+  }
+  if (/(~~|～～|那个|老样子|老地方|A计划|B计划|暗号|照旧)/i.test(text)) {
+    reasons.push("abstract-symbol");
+  }
+  if (aliases.some((alias) => alias.alias && text.includes(alias.alias))) {
+    reasons.push("known-alias");
+  }
+  if (/^(可以|行|好|好的|可以的|没问题|嗯|对|就这样|那就这样|ok|OK)$/i.test(text.trim())) {
+    reasons.push("confirmation-reply");
+  }
+  return Array.from(new Set(reasons));
+}
+
+function buildCandidateWindow(
+  conversationMessages: TestMessage[],
+  currentMessage: TestMessage
+) {
+  const sortedMessages = [...conversationMessages].sort((a, b) => a.sentAt - b.sentAt);
+  const currentIndex = sortedMessages.findIndex(
+    (message) => message.id === currentMessage.id
+  );
+  if (currentIndex < 0) return [currentMessage];
+
+  const start = Math.max(0, currentIndex - 5);
+  const end = Math.min(sortedMessages.length, currentIndex + 6);
+  let windowMessages = sortedMessages.slice(start, end);
+  if (windowMessages.length > 10) {
+    const currentInWindow = windowMessages.findIndex(
+      (message) => message.id === currentMessage.id
+    );
+    const trimStart = Math.max(0, currentInWindow - 5);
+    windowMessages = windowMessages.slice(trimStart, trimStart + 10);
+  }
+  return windowMessages;
+}
+
+function recallRecognitionCandidates(
+  conversationMessages: TestMessage[],
+  candidateMessages: TestMessage[],
+  aliases: ChatAliasEntry[]
+): RecalledRecognitionCandidate[] {
+  return candidateMessages
+    .map((message) => ({
+      currentMessage: message,
+      messages: buildCandidateWindow(conversationMessages, message),
+      reasons: getRecallReasons(message.text, aliases),
+    }))
+    .filter((candidate) => candidate.reasons.length > 0);
+}
+
 function getLatestIdentityMessage(messages: TestMessage[], identityId: string) {
   return messages
     .filter((message) => message.identityId === identityId)
@@ -198,11 +645,23 @@ export default function AdminMessageConsole() {
   });
   const [autoRecognitionStatus, setAutoRecognitionStatus] =
     React.useState<AutoRecognitionStatus>({ status: "idle" });
+  const [chatArrangementConfirmations, setChatArrangementConfirmations] =
+    React.useState(getInitialChatArrangementConfirmations);
+  const [arrangementUpdateToast, setArrangementUpdateToast] =
+    React.useState<ArrangementUpdateToast | null>(null);
+  const [activeConversationIntents, setActiveConversationIntents] =
+    React.useState(getInitialActiveConversationIntents);
+  const [ambiguousArrangementUpdate, setAmbiguousArrangementUpdate] =
+    React.useState<AmbiguousArrangementUpdate | null>(null);
+  const [aliasCandidateConfirmation, setAliasCandidateConfirmation] =
+    React.useState<AliasCandidateConfirmation | null>(null);
+  const [chatAliases, setChatAliases] = React.useState(getInitialChatAliases);
   const [messageTextFocused, setMessageTextFocused] = React.useState(false);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const identityPickerRef = React.useRef<HTMLDivElement>(null);
   const groupPickerRef = React.useRef<HTMLDivElement>(null);
   const adminInfoRef = React.useRef<HTMLDivElement>(null);
+  const arrangementUpdateUndoTimerRef = React.useRef<number | null>(null);
 
   const activeIdentity =
     identities.find((identity) => identity.id === activeIdentityId) ?? identities[0] ?? null;
@@ -214,6 +673,11 @@ export default function AdminMessageConsole() {
       : activeIdentity
         ? getPrivateConversationId(activeIdentity.id)
         : "";
+  const activeAliasCandidateConfirmation =
+    aliasCandidateConfirmation?.conversationId === activeConversationId &&
+    aliasCandidateConfirmation.conversationType === messageMode
+      ? aliasCandidateConfirmation
+      : null;
   const activeMessages = React.useMemo(
     () =>
       activeConversationId
@@ -222,6 +686,29 @@ export default function AdminMessageConsole() {
             .sort((a, b) => a.sentAt - b.sentAt)
         : [],
     [activeConversationId, messages]
+  );
+  const activeChatArrangementConfirmations = React.useMemo(
+    () =>
+      chatArrangementConfirmations
+        .filter(
+          (confirmation) =>
+            confirmation.sourceConversationId === activeConversationId &&
+            confirmation.sourceConversationType === messageMode
+        )
+        .sort((a, b) => a.createdAt - b.createdAt),
+    [activeConversationId, chatArrangementConfirmations, messageMode]
+  );
+  const activeAliases = React.useMemo(
+    () =>
+      chatAliases
+        .filter(
+          (alias) =>
+            alias.scope === "global" ||
+            (alias.conversationId === activeConversationId &&
+              alias.conversationType === messageMode)
+        )
+        .sort((a, b) => b.updatedAt - a.updatedAt),
+    [activeConversationId, chatAliases, messageMode]
   );
   const activeMessageKey = activeMessages.at(-1)?.id ?? "empty";
   const canSendMessage = Boolean(
@@ -287,7 +774,15 @@ export default function AdminMessageConsole() {
       });
     };
 
+    const refreshChatAliases = () => {
+      setChatAliases(getInitialChatAliases());
+    };
+
     const handleStorage = (event: StorageEvent) => {
+      if (event.key === chatAliasMapStorageKey) {
+        refreshChatAliases();
+        return;
+      }
       if (
         event.key !== testIdentitiesStorageKey &&
         event.key !== testGroupsStorageKey &&
@@ -300,15 +795,26 @@ export default function AdminMessageConsole() {
 
     window.addEventListener("storage", handleStorage);
     window.addEventListener(testConversationStorageEvent, refreshTestConversations);
+    window.addEventListener(chatAliasMapStorageEvent, refreshChatAliases);
     return () => {
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener(testConversationStorageEvent, refreshTestConversations);
+      window.removeEventListener(chatAliasMapStorageEvent, refreshChatAliases);
     };
   }, []);
 
   React.useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ block: "end" });
   }, [activeMessageKey]);
+
+  React.useEffect(
+    () => () => {
+      if (arrangementUpdateUndoTimerRef.current) {
+        window.clearTimeout(arrangementUpdateUndoTimerRef.current);
+      }
+    },
+    []
+  );
 
   React.useEffect(() => {
     if (!showIdentityPicker) return;
@@ -426,7 +932,6 @@ export default function AdminMessageConsole() {
     if (messageMode === "group" && !activeGroup) return;
 
     const sendingMode = messageMode;
-    const activeConversationIdentityId = activeIdentity.id;
     setMessages((prev) => {
       const nextMessage =
         sendingMode === "group" && activeGroup
@@ -440,8 +945,7 @@ export default function AdminMessageConsole() {
       if (sendingMode === "private") {
         void recognizePrivateMessageArrangements(
           nextMessages,
-          nextMessage.conversationId,
-          activeConversationIdentityId
+          nextMessage.conversationId
         );
       } else if (activeGroup) {
         void recognizeGroupMessageArrangements(
@@ -482,10 +986,692 @@ export default function AdminMessageConsole() {
     }
   };
 
+  const publishChatArrangementConfirmations = (
+    confirmations: ChatArrangementConfirmation[]
+  ) => {
+    setChatArrangementConfirmations(confirmations);
+    persistChatArrangementConfirmations(confirmations);
+  };
+
+  const queueChatArrangementConfirmations = (
+    drafts: ArrangementDraftWithRecognitionMeta[],
+    conversationId: string,
+    conversationType: TestConversationType,
+    sourceMessageIds: string[],
+    sourceSummary: string
+  ) => {
+    const now = Date.now();
+    const nextConfirmations = [
+      ...chatArrangementConfirmations,
+      ...drafts.map((draft, index) => ({
+        ...draft,
+        id: `chat-confirmation-${now}-${index}`,
+        sourceConversationId: conversationId,
+        sourceConversationType: conversationType,
+        sourceMessageIds,
+        sourceSummary,
+        createdAt: now + index,
+      })),
+    ];
+    publishChatArrangementConfirmations(nextConfirmations);
+  };
+
+  const removeChatArrangementConfirmation = (confirmationId: string) => {
+    publishChatArrangementConfirmations(
+      chatArrangementConfirmations.filter(
+        (confirmation) => confirmation.id !== confirmationId
+      )
+    );
+  };
+
+  const confirmChatArrangement = (confirmation: ChatArrangementConfirmation) => {
+    const now = Date.now();
+    const locationName =
+      confirmation.locationName.trim() || confirmation.locationText.trim();
+    const sourceLabel =
+      confirmation.source === "ai_group_chat"
+        ? "AI 群聊识别"
+        : confirmation.source === "rules"
+          ? "规则识别"
+          : "AI 私聊识别";
+    const arrangement: ArrangementItem = {
+      id: `admin-chat-arrangement-${now}`,
+      title: confirmation.title.trim(),
+      timeText: confirmation.timeText.trim(),
+      dateKey: confirmation.dateKey,
+      startTime: confirmation.startTime,
+      endTime: confirmation.endTime,
+      timeKind: confirmation.dateKey ? confirmation.timeKind : "none",
+      peopleText: confirmation.peopleText.trim(),
+      locationText: locationName,
+      locationName,
+      note: confirmation.note.trim(),
+      source: sourceLabel,
+      status: "pending",
+      createdAt: now,
+      pinned: false,
+      contexts: confirmation.contexts,
+      sourceConversationId: confirmation.sourceConversationId,
+      sourceConversationType: confirmation.sourceConversationType,
+      sourceMessageIds: confirmation.sourceMessageIds,
+      sourceType: confirmation.sourceType,
+      unknownAliasText: confirmation.unknownAliasText,
+      suggestedAliasMeaning: confirmation.suggestedAliasMeaning,
+      aliasLearningStatus: confirmation.suggestedAliasMeaning
+        ? "confirmed"
+        : confirmation.aliasLearningStatus,
+    };
+    const aliasText = confirmation.unknownAliasText?.trim() ?? "";
+    const aliasMeaning = confirmation.suggestedAliasMeaning?.trim() ?? "";
+    if (
+      confirmation.sourceType === "unknown_alias_arrangement" &&
+      aliasText &&
+      aliasMeaning
+    ) {
+      const nextAlias: ChatAliasEntry = {
+        id: `learned-alias-${now}`,
+        conversationId: confirmation.sourceConversationId,
+        conversationType: confirmation.sourceConversationType,
+        alias: aliasText,
+        meaning: aliasMeaning,
+        scope: "conversation",
+        sourceMessageIds: confirmation.sourceMessageIds,
+        sourceSummary: confirmation.sourceSummary,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const nextAliases = [
+        nextAlias,
+        ...getInitialChatAliases().filter(
+          (item) =>
+            !(
+              item.conversationId === nextAlias.conversationId &&
+              item.conversationType === nextAlias.conversationType &&
+              item.alias === nextAlias.alias
+            )
+        ),
+      ];
+      setChatAliases(nextAliases);
+      persistChatAliases(nextAliases);
+    }
+    appendArrangement(arrangement);
+    rememberActiveConversationIntent(arrangement, confirmation.sourceMessageIds);
+    removeChatArrangementConfirmation(confirmation.id);
+    setAutoRecognitionStatus({
+      status: "success",
+      message: "已添加到安排。",
+    });
+  };
+
+  const confirmAliasCandidate = (confirmation: AliasCandidateConfirmation) => {
+    const now = Date.now();
+    const aliasText = confirmation.aliasText.trim();
+    const aliasMeaning = confirmation.aliasMeaning.trim();
+    if (!aliasText || !aliasMeaning) return;
+
+    const nextAlias: ChatAliasEntry = {
+      id: `learned-alias-${now}`,
+      conversationId: confirmation.conversationId,
+      conversationType: confirmation.conversationType,
+      alias: aliasText,
+      meaning: aliasMeaning,
+      scope: "conversation",
+      sourceMessageIds: confirmation.sourceMessageIds,
+      sourceSummary: confirmation.sourceSummary,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const nextAliases = [
+      nextAlias,
+      ...getInitialChatAliases().filter(
+        (item) =>
+          !(
+            item.conversationId === nextAlias.conversationId &&
+            item.conversationType === nextAlias.conversationType &&
+            item.alias === nextAlias.alias
+          )
+      ),
+    ];
+    setChatAliases(nextAliases);
+    persistChatAliases(nextAliases);
+    setAliasCandidateConfirmation(null);
+    setAutoRecognitionStatus({
+      status: "success",
+      message: "已将 AI 猜测的暗语写入 App 暗语设置。",
+    });
+  };
+
+  const buildJudgeInputFromCandidate = (
+    candidate: RecalledRecognitionCandidate,
+    conversationType: TestConversationType,
+    conversationId: string
+  ): ArrangementJudgeInput => {
+    const activeIntent =
+      activeConversationIntents.find(
+        (intent) =>
+          intent.conversationId === conversationId &&
+          intent.conversationType === conversationType
+      ) ?? null;
+    const judgeMessages = buildJudgeMessages(
+      candidate.messages,
+      candidate.currentMessage.id,
+      identities
+    );
+    const currentMessage =
+      judgeMessages.find((message) => message.isCurrent) ?? judgeMessages.at(-1);
+
+    return {
+      conversationType,
+      currentMessage: currentMessage ?? {
+        id: candidate.currentMessage.id,
+        sender: getMessageSpeaker(candidate.currentMessage, identities),
+        senderRole: candidate.currentMessage.sender === "demo" ? "me" : "other",
+        text: candidate.currentMessage.text,
+        sentAt: candidate.currentMessage.sentAt,
+        isCurrent: true,
+      },
+      messages: judgeMessages,
+      existingArrangements: getInitialArrangements().filter(
+        (item) => item.status !== "completed"
+      ),
+      knownAliases: activeAliases.map((alias) => ({
+        alias: alias.alias,
+        meaning: alias.meaning,
+        scope: alias.scope,
+      })),
+      activeConversationIntent: activeIntent
+        ? {
+            arrangementId: activeIntent.arrangementId,
+            topic: activeIntent.topic,
+            participantIds: activeIntent.participantIds,
+            sourceMessageIds: activeIntent.sourceMessageIds,
+          }
+        : null,
+      recallReasons: candidate.reasons,
+    };
+  };
+
+  const buildConfirmationDraftFromJudgeAction = (
+    action: ArrangementJudgeAction,
+    candidate: RecalledRecognitionCandidate,
+    conversationType: TestConversationType,
+    sourceSummary: string
+  ): ArrangementDraftWithRecognitionMeta | null => {
+    if (!action.draft) return null;
+    const isUnknownAlias = action.type === "unknown_symbol_arrangement";
+
+    return {
+      ...action.draft,
+      confidence: action.confidence,
+      contexts: Array.from(
+        new Set([
+          ...(action.draft.contexts ?? []),
+          `AI 判断：${action.reason}`,
+          `规则召回：${candidate.reasons.join("、")}`,
+        ])
+      ),
+      source: conversationType === "group" ? "ai_group_chat" : "ai",
+      sourceType: isUnknownAlias ? "unknown_alias_arrangement" : undefined,
+      unknownAliasText: isUnknownAlias ? action.aliasText : undefined,
+      suggestedAliasMeaning: isUnknownAlias ? action.aliasMeaning : undefined,
+      aliasLearningStatus:
+        isUnknownAlias && action.aliasMeaning ? "suggested" : undefined,
+      aiActionType: isUnknownAlias ? "unknown_symbol_arrangement" : "new_arrangement",
+      aiReason: action.reason,
+      candidateReason: candidate.reasons.join("、"),
+      candidateArrangementIds: action.candidateArrangementIds,
+      note: action.draft.note || sourceSummary,
+    };
+  };
+
+  const handleJudgeAction = (
+    action: ArrangementJudgeAction,
+    candidate: RecalledRecognitionCandidate,
+    conversationId: string,
+    conversationType: TestConversationType,
+    sourceMessageIds: string[],
+    sourceSummary: string
+  ) => {
+    const candidateArrangements = getInitialArrangements().filter(
+      (item) => item.status !== "completed"
+    );
+    const scoredCandidates = scoreArrangementCandidates(
+      candidateArrangements,
+      conversationId,
+      conversationType,
+      candidate.messages.map((message) => message.text).join("\n"),
+      candidate.messages
+    );
+
+    if (action.type === "update_existing" && action.update) {
+      const didQueueUpdate = resolveArrangementUpdate(
+        {
+          ...action.update,
+          confidence: action.confidence,
+          reason: action.reason,
+        },
+        scoredCandidates,
+        sourceMessageIds,
+        conversationType
+      );
+      return didQueueUpdate;
+    }
+
+    if (action.type === "alias_candidate") {
+      const aliasText = action.aliasText?.trim() ?? "";
+      const aliasMeaning = action.aliasMeaning?.trim() ?? "";
+      if (!aliasText || !aliasMeaning) return false;
+
+      setAliasCandidateConfirmation({
+        id: `alias-candidate-${Date.now()}`,
+        conversationId,
+        conversationType,
+        aliasText,
+        aliasMeaning,
+        confidence: action.confidence,
+        reason: action.reason,
+        sourceMessageIds,
+        sourceSummary,
+      });
+      setAutoRecognitionStatus({
+        status: "info",
+        message: "AI 猜测到一个暗语含义，请先确认是否写入暗语设置。",
+      });
+      return true;
+    }
+
+    if (
+      action.type === "new_arrangement" ||
+      action.type === "unknown_symbol_arrangement"
+    ) {
+      const draft = buildConfirmationDraftFromJudgeAction(
+        action,
+        candidate,
+        conversationType,
+        sourceSummary
+      );
+      if (!draft) return false;
+      queueChatArrangementConfirmations(
+        [draft],
+        conversationId,
+        conversationType,
+        sourceMessageIds,
+        sourceSummary
+      );
+      return true;
+    }
+
+    return false;
+  };
+
+  const publishActiveConversationIntents = (
+    intents: ActiveConversationIntent[]
+  ) => {
+    setActiveConversationIntents(intents);
+    persistActiveConversationIntents(intents);
+  };
+
+  const rememberActiveConversationIntent = (
+    arrangement: ArrangementItem,
+    sourceMessageIds: string[]
+  ) => {
+    if (!arrangement.sourceConversationId || !arrangement.sourceConversationType) {
+      return;
+    }
+
+    const nextIntent: ActiveConversationIntent = {
+      conversationId: arrangement.sourceConversationId,
+      conversationType: arrangement.sourceConversationType,
+      arrangementId: arrangement.id,
+      topic: [
+        arrangement.title,
+        arrangement.locationName || arrangement.locationText,
+        arrangement.note,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      participantIds: arrangement.peopleText
+        .split(/[，,、\s]/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+      sourceMessageIds,
+      updatedAt: Date.now(),
+    };
+    const nextIntents = [
+      nextIntent,
+      ...activeConversationIntents.filter(
+        (intent) =>
+          !(
+            intent.conversationId === nextIntent.conversationId &&
+            intent.conversationType === nextIntent.conversationType
+          )
+      ),
+    ].slice(0, 12);
+    publishActiveConversationIntents(nextIntents);
+  };
+
+  const publishArrangements = (items: ArrangementItem[]) => {
+    persistArrangements(items);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(arrangementStorageEvent));
+    }
+  };
+
+  const undoArrangementUpdate = (previousItems: ArrangementItem[]) => {
+    const previousMap = new Map(previousItems.map((item) => [item.id, item]));
+    const restoredItems = getInitialArrangements().map((item) =>
+      previousMap.get(item.id) ?? item
+    );
+    publishArrangements(restoredItems);
+    setArrangementUpdateToast(null);
+    if (arrangementUpdateUndoTimerRef.current) {
+      window.clearTimeout(arrangementUpdateUndoTimerRef.current);
+      arrangementUpdateUndoTimerRef.current = null;
+    }
+    setAutoRecognitionStatus({
+      status: "info",
+      message: "已撤销本次自动补全。",
+    });
+  };
+
+  const applyArrangementUpdates = (
+    updates: ArrangementUpdatePatch[],
+    sourceMessageIds: string[]
+  ) => {
+    if (!Array.isArray(updates) || updates.length === 0) return false;
+
+    const currentArrangements = getInitialArrangements();
+    const previousItems = currentArrangements.filter((item) =>
+      updates.some((update) => update.arrangementId === item.id)
+    );
+    if (previousItems.length === 0) return false;
+
+    const updateMap = new Map(updates.map((update) => [update.arrangementId, update]));
+    const nextArrangements = currentArrangements.map((item) => {
+      const update = updateMap.get(item.id);
+      if (!update) return item;
+      const locationName =
+        update.locationName?.trim() ||
+        update.locationText?.trim() ||
+        item.locationName;
+      const noteAppend = update.noteAppend?.trim();
+      const nextContexts = [...(item.contexts ?? []), update.context].filter(Boolean);
+      const nextSourceMessageIds = [
+        ...(item.sourceMessageIds ?? []),
+        ...sourceMessageIds,
+      ];
+
+      return {
+        ...item,
+        timeText: update.timeText?.trim() || item.timeText,
+        dateKey: update.dateKey?.trim() || item.dateKey,
+        startTime: update.startTime?.trim() || item.startTime,
+        endTime: update.endTime?.trim() || item.endTime,
+        timeKind:
+          update.timeKind && update.timeKind !== "none"
+            ? update.timeKind
+            : item.timeKind,
+        peopleText: update.peopleText?.trim() || item.peopleText,
+        locationText: locationName,
+        locationName,
+        note: noteAppend
+          ? item.note
+            ? `${item.note}\n${noteAppend}`
+            : noteAppend
+          : item.note,
+        contexts: Array.from(new Set(nextContexts)),
+        sourceMessageIds: Array.from(new Set(nextSourceMessageIds)),
+      };
+    });
+
+    publishArrangements(nextArrangements);
+    setArrangementUpdateToast({
+      itemTitle: previousItems[0]?.title ?? "安排",
+      previousItems,
+    });
+    if (arrangementUpdateUndoTimerRef.current) {
+      window.clearTimeout(arrangementUpdateUndoTimerRef.current);
+    }
+    arrangementUpdateUndoTimerRef.current = window.setTimeout(() => {
+      setArrangementUpdateToast(null);
+      arrangementUpdateUndoTimerRef.current = null;
+    }, arrangementUpdateUndoMs);
+    return true;
+  };
+
+  const scoreArrangementCandidates = (
+    arrangements: ArrangementItem[],
+    conversationId: string,
+    conversationType: TestConversationType,
+    contextText: string,
+    latestMessages: TestMessage[]
+  ): ScoredArrangementCandidate[] => {
+    const activeIntent = activeConversationIntents.find(
+      (intent) =>
+        intent.conversationId === conversationId &&
+        intent.conversationType === conversationType
+    );
+    const normalizedContext = contextText.toLowerCase();
+    const latestText = latestMessages.at(-1)?.text.trim() ?? "";
+    const isShortReply =
+      /^(可以|行|好|好的|可以的|那就这样|8点|八点)$/i.test(
+        latestText
+      ) ||
+      /(几点|怎么说)$/.test(latestText) ||
+      latestText.length <= 4;
+
+    return arrangements
+      .map<ScoredArrangementCandidate>((arrangement) => {
+        let score = 0;
+        const reasons: string[] = [];
+
+        if (
+          arrangement.sourceConversationId === conversationId &&
+          arrangement.sourceConversationType === conversationType
+        ) {
+          score += 0.3;
+          reasons.push("same-conversation");
+        }
+
+        if (activeIntent?.arrangementId === arrangement.id) {
+          score += isShortReply ? 0.42 : 0.28;
+          reasons.push("active-intent");
+        }
+
+        const topicTokens = [
+          arrangement.title,
+          arrangement.locationName,
+          arrangement.locationText,
+          arrangement.note,
+          activeIntent?.arrangementId === arrangement.id ? activeIntent.topic : "",
+        ]
+          .join(" ")
+          .split(/[，。；、\s]/)
+          .map((item) => item.trim().toLowerCase())
+          .filter((item) => item.length >= 2);
+        const matchedTopicCount = topicTokens.filter((token) =>
+          normalizedContext.includes(token)
+        ).length;
+        if (matchedTopicCount > 0) {
+          score += Math.min(0.24, matchedTopicCount * 0.08);
+          reasons.push("topic");
+        }
+
+        const peopleTokens = arrangement.peopleText
+          .split(/[，,、\s]/)
+          .map((item) => item.trim().toLowerCase())
+          .filter((item) => item.length >= 2);
+        if (peopleTokens.some((token) => normalizedContext.includes(token))) {
+          score += 0.12;
+          reasons.push("people");
+        }
+
+        const lastArrangementMessageAt = latestMessages.some((message) =>
+          arrangement.sourceMessageIds?.includes(message.id)
+        );
+        if (lastArrangementMessageAt) {
+          score += 0.08;
+          reasons.push("source-message");
+        }
+
+        const messageDistanceMs =
+          latestMessages.at(-1)?.sentAt && arrangement.createdAt
+            ? Math.abs((latestMessages.at(-1)?.sentAt ?? 0) - arrangement.createdAt)
+            : Number.POSITIVE_INFINITY;
+        if (messageDistanceMs < 1000 * 60 * 60 * 6) {
+          score += 0.08;
+          reasons.push("time-distance");
+        }
+
+        if (isShortReply && activeIntent?.arrangementId !== arrangement.id) {
+          score -= 0.18;
+          reasons.push("short-reply-penalty");
+        }
+
+        return {
+          arrangement,
+          score: Math.max(0, Math.min(1, score)),
+          reasons,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+  };
+
+  const resolveArrangementUpdate = (
+    update: ArrangementUpdatePatch,
+    candidates: ScoredArrangementCandidate[],
+    sourceMessageIds: string[],
+    conversationType: TestConversationType
+  ) => {
+    const aiSelectedCandidate =
+      candidates.find((candidate) => candidate.arrangement.id === update.arrangementId) ??
+      candidates[0];
+    const topCandidate = candidates[0];
+    const selectedCandidate =
+      topCandidate && aiSelectedCandidate && topCandidate.score - aiSelectedCandidate.score > 0.2
+        ? topCandidate
+        : aiSelectedCandidate;
+    if (!selectedCandidate) return false;
+
+    const secondCandidate = candidates.find(
+      (candidate) => candidate.arrangement.id !== selectedCandidate.arrangement.id
+    );
+    const effectiveConfidence = Math.min(
+      1,
+      update.confidence * 0.6 + selectedCandidate.score * 0.5
+    );
+
+    const hasSimilarCandidate =
+      secondCandidate &&
+      Math.abs(selectedCandidate.score - secondCandidate.score) <=
+        ambiguousUpdateGapThreshold;
+    setAmbiguousArrangementUpdate({
+      patch: {
+        ...update,
+        arrangementId: selectedCandidate.arrangement.id,
+        confidence: effectiveConfidence,
+      },
+      candidates: hasSimilarCandidate ? candidates.slice(0, 3) : [selectedCandidate],
+      sourceMessageIds,
+      conversationType,
+      aiReason: update.reason,
+    });
+    setAutoRecognitionStatus({
+      status: "info",
+      message: hasSimilarCandidate
+        ? "AI 找到多个可能相关的事项，请先选择要更新哪一个。"
+        : "这条消息可能在补充已有事项，请先确认。",
+    });
+    return true;
+  };
+
+  const confirmAmbiguousArrangementUpdate = (arrangementId: string) => {
+    if (!ambiguousArrangementUpdate) return;
+
+    const target = ambiguousArrangementUpdate.candidates.find(
+      (candidate) => candidate.arrangement.id === arrangementId
+    );
+    if (!target) return;
+
+    const didUpdate = applyArrangementUpdates(
+      [
+        {
+          ...ambiguousArrangementUpdate.patch,
+          arrangementId,
+          confidence: Math.max(
+            ambiguousArrangementUpdate.patch.confidence,
+            target.score
+          ),
+        },
+      ],
+      ambiguousArrangementUpdate.sourceMessageIds
+    );
+    if (didUpdate) {
+      rememberActiveConversationIntent(
+        target.arrangement,
+        ambiguousArrangementUpdate.sourceMessageIds
+      );
+      if (ambiguousArrangementUpdate.conversationType === "group") {
+        markGroupRecognitionMessagesPushed(
+          ambiguousArrangementUpdate.sourceMessageIds
+        );
+      } else {
+        markPrivateRecognitionMessagesPushed(
+          ambiguousArrangementUpdate.sourceMessageIds
+        );
+      }
+      setAmbiguousArrangementUpdate(null);
+      setAutoRecognitionStatus({
+        status: "success",
+        message: "已按选择更新事项安排。",
+      });
+    }
+  };
+
+  const createNewFromAmbiguousUpdate = () => {
+    if (!ambiguousArrangementUpdate) return;
+
+    const patch = ambiguousArrangementUpdate.patch;
+    const now = Date.now();
+    const title = patch.noteAppend || patch.context.split("\n").at(-1) || "新的事项安排";
+    const locationName = patch.locationName?.trim() || patch.locationText?.trim() || "";
+    const arrangement: ArrangementItem = {
+      id: `admin-chat-arrangement-${now}`,
+      title,
+      timeText: patch.timeText?.trim() || "",
+      dateKey: patch.dateKey?.trim() || "",
+      startTime: patch.startTime?.trim() || "",
+      endTime: patch.endTime?.trim() || "",
+      timeKind: patch.dateKey ? patch.timeKind ?? "none" : "none",
+      peopleText: patch.peopleText?.trim() || "",
+      locationText: locationName,
+      locationName,
+      note: patch.noteAppend?.trim() || "",
+      source: "来自聊天确认",
+      status: "pending",
+      createdAt: now,
+      pinned: false,
+      contexts: [patch.context],
+      sourceMessageIds: ambiguousArrangementUpdate.sourceMessageIds,
+    };
+    appendArrangement(arrangement);
+    if (ambiguousArrangementUpdate.conversationType === "group") {
+      markGroupRecognitionMessagesPushed(ambiguousArrangementUpdate.sourceMessageIds);
+    } else {
+      markPrivateRecognitionMessagesPushed(
+        ambiguousArrangementUpdate.sourceMessageIds
+      );
+    }
+    setAmbiguousArrangementUpdate(null);
+    setAutoRecognitionStatus({
+      status: "success",
+      message: "已新建事项安排。",
+    });
+  };
+
   const recognizePrivateMessageArrangements = async (
     nextMessages: TestMessage[],
-    conversationId: string,
-    identityId: string
+    conversationId: string
   ) => {
     const pushedMessageIds = new Set(getPushedPrivateRecognitionMessageIds());
     const recognitionMessages = nextMessages
@@ -508,42 +1694,67 @@ export default function AdminMessageConsole() {
       return;
     }
 
-    const contextText = buildPrivateConversationContext(
-      recognitionMessages,
-      identities,
-      conversationId,
-      identityId
+    const conversationMessages = nextMessages.filter(
+      (message) =>
+        message.conversationId === conversationId &&
+        message.conversationType === "private"
     );
-    const result = await recognizeArrangementFromPrivateChat(contextText);
+    const candidates = recallRecognitionCandidates(
+      conversationMessages,
+      recognitionMessages,
+      activeAliases
+    );
 
-    if (result.status === "success") {
-      appendPendingArrangementDrafts(
-        result.drafts.map((draft) => ({
-          ...draft,
-          source: result.source,
-        }))
-      );
-      markPrivateRecognitionMessagesPushed(
-        recognitionMessages.map((message) => message.id)
-      );
+    if (candidates.length === 0) {
       setAutoRecognitionStatus({
-        status: "success",
-        message: `已识别到 ${result.drafts.length} 条待确认安排，已推送到移动端安排页。`,
+        status: "info",
+        message: "本地规则没有召回候选消息，未提交给 AI 做最终判断。",
       });
       return;
     }
 
-    if (result.status === "not_configured") {
-      setAutoRecognitionStatus({ status: "info", message: result.message });
-      return;
+    let handledCount = 0;
+    const judgedMessageIds: string[] = [];
+    for (const candidate of candidates) {
+      const result = await judgeArrangementIntentFromChat(
+        buildJudgeInputFromCandidate(candidate, "private", conversationId)
+      );
+      const sourceMessageIds = candidate.messages.map((message) => message.id);
+      const sourceSummary = buildRecognitionSourceSummary(
+        candidate.messages,
+        identities
+      );
+
+      if (result.status === "not_configured" || result.status === "failed") {
+        setAutoRecognitionStatus({ status: "info", message: result.message });
+        return;
+      }
+
+      for (const action of result.actions) {
+        if (
+          handleJudgeAction(
+            action,
+            candidate,
+            conversationId,
+            "private",
+            sourceMessageIds,
+            sourceSummary
+          )
+        ) {
+          handledCount += 1;
+        }
+      }
+      judgedMessageIds.push(candidate.currentMessage.id);
     }
 
-    if (result.status === "empty") {
-      setAutoRecognitionStatus({ status: "info", message: "未识别到安排。" });
-      return;
-    }
-
-    setAutoRecognitionStatus({ status: "error", message: result.message });
+    markPrivateRecognitionMessagesPushed(judgedMessageIds);
+    setAutoRecognitionStatus({
+      status: handledCount > 0 ? "success" : "info",
+      message:
+        handledCount > 0
+          ? `已识别到 ${handledCount} 条需要确认的结果。`
+          : "AI 判断候选消息无需创建、更新安排或学习暗语。",
+    });
   };
 
   const recognizeGroupMessageArrangements = async (
@@ -570,43 +1781,67 @@ export default function AdminMessageConsole() {
       return;
     }
 
-    const contextText = buildGroupConversationContext(
-      recognitionMessages,
-      identities
+    const conversationMessages = nextMessages.filter(
+      (message) =>
+        message.conversationId === conversationId &&
+        message.conversationType === "group"
     );
-    const result = await recognizeArrangementFromGroupChat(contextText);
+    const candidates = recallRecognitionCandidates(
+      conversationMessages,
+      recognitionMessages,
+      activeAliases
+    );
 
-    if (result.status === "success") {
-      appendPendingArrangementDrafts(
-        result.drafts.map((draft) => ({
-          ...draft,
-          source: "ai_group_chat",
-        }))
-      );
-      markGroupRecognitionMessagesPushed(
-        recognitionMessages.map((message) => message.id)
-      );
-      setAutoRecognitionStatus({
-        status: "success",
-        message: `已识别到 ${result.drafts.length} 条群聊待确认安排，已推送到移动端安排页。`,
-      });
-      return;
-    }
-
-    if (result.status === "not_configured") {
-      setAutoRecognitionStatus({ status: "info", message: result.message });
-      return;
-    }
-
-    if (result.status === "empty") {
+    if (candidates.length === 0) {
       setAutoRecognitionStatus({
         status: "info",
-        message: "未识别到需要我完成的群聊安排。",
+        message: "本地规则没有召回群聊候选消息，未提交给 AI 做最终判断。",
       });
       return;
     }
 
-    setAutoRecognitionStatus({ status: "error", message: result.message });
+    let handledCount = 0;
+    const judgedMessageIds: string[] = [];
+    for (const candidate of candidates) {
+      const result = await judgeArrangementIntentFromChat(
+        buildJudgeInputFromCandidate(candidate, "group", conversationId)
+      );
+      const sourceMessageIds = candidate.messages.map((message) => message.id);
+      const sourceSummary = buildRecognitionSourceSummary(
+        candidate.messages,
+        identities
+      );
+
+      if (result.status === "not_configured" || result.status === "failed") {
+        setAutoRecognitionStatus({ status: "info", message: result.message });
+        return;
+      }
+
+      for (const action of result.actions) {
+        if (
+          handleJudgeAction(
+            action,
+            candidate,
+            conversationId,
+            "group",
+            sourceMessageIds,
+            sourceSummary
+          )
+        ) {
+          handledCount += 1;
+        }
+      }
+      judgedMessageIds.push(candidate.currentMessage.id);
+    }
+
+    markGroupRecognitionMessagesPushed(judgedMessageIds);
+    setAutoRecognitionStatus({
+      status: handledCount > 0 ? "success" : "info",
+      message:
+        handledCount > 0
+          ? `已识别到 ${handledCount} 条群聊结果，请先确认。`
+          : "AI 判断群聊候选消息无需创建、更新安排或学习暗语。",
+    });
   };
 
   return (
@@ -705,7 +1940,44 @@ export default function AdminMessageConsole() {
                 )}
               </div>
             )}
+            {activeAliases.length > 0 && (
+              <span className="inline-flex items-center rounded-[10px] border border-[var(--admin-border)] bg-[var(--admin-input-bg)] px-3 py-2 text-[12px] leading-4 text-text-tertiary">
+                App 暗语 {activeAliases.length}
+              </span>
+            )}
           </div>
+
+          {ambiguousArrangementUpdate && (
+            <div className="shrink-0 border-b border-[var(--admin-border-subtle)] bg-[var(--admin-panel-bg)] px-5 py-3">
+              <AmbiguousArrangementUpdatePanel
+                update={ambiguousArrangementUpdate}
+                onChoose={confirmAmbiguousArrangementUpdate}
+                onCreateNew={createNewFromAmbiguousUpdate}
+                onIgnore={() => setAmbiguousArrangementUpdate(null)}
+              />
+            </div>
+          )}
+
+          {activeChatArrangementConfirmations.length > 0 && (
+            <div className="shrink-0 border-b border-[var(--admin-border-subtle)] bg-[var(--admin-panel-bg)] px-5 py-3">
+              <ChatArrangementConfirmationCard
+                confirmation={activeChatArrangementConfirmations[0]}
+                queueCount={activeChatArrangementConfirmations.length}
+                onConfirm={confirmChatArrangement}
+                onIgnore={removeChatArrangementConfirmation}
+              />
+            </div>
+          )}
+
+          {activeAliasCandidateConfirmation && (
+            <div className="shrink-0 border-b border-[var(--admin-border-subtle)] bg-[var(--admin-panel-bg)] px-5 py-3">
+              <AliasCandidateConfirmationCard
+                confirmation={activeAliasCandidateConfirmation}
+                onConfirm={confirmAliasCandidate}
+                onIgnore={() => setAliasCandidateConfirmation(null)}
+              />
+            </div>
+          )}
 
           <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5 pt-4">
             <div className="mx-auto flex min-h-full w-full flex-col">
@@ -738,6 +2010,10 @@ export default function AdminMessageConsole() {
           </div>
 
           <div className="shrink-0 bg-[var(--admin-panel-bg)] px-5 pb-4 pt-3">
+            <ArrangementUpdateToastPanel
+              toast={arrangementUpdateToast}
+              onUndo={undoArrangementUpdate}
+            />
             <AutoRecognitionStatusPanel status={autoRecognitionStatus} />
             <AiTestResultPanel result={aiTestResult} />
             {activeIdentity ? (
@@ -967,41 +2243,441 @@ export default function AdminMessageConsole() {
   );
 }
 
-function buildPrivateConversationContext(
-  messages: TestMessage[],
-  identities: TestIdentity[],
-  conversationId: string,
-  identityId: string
-) {
-  const identityName =
-    identities.find((identity) => identity.id === identityId)?.name ?? "对方";
+function ArrangementUpdateToastPanel({
+  toast,
+  onUndo,
+}: {
+  toast: ArrangementUpdateToast | null;
+  onUndo: (previousItems: ArrangementItem[]) => void;
+}) {
+  if (!toast) return null;
 
-  return messages
-    .filter((message) => message.conversationId === conversationId)
-    .sort((a, b) => a.sentAt - b.sentAt)
-    .slice(-8)
-    .map((message) => {
-      const speaker = message.sender === "demo" ? "我" : identityName;
-      return `${speaker}：${message.text}`;
-    })
-    .join("\n");
+  return (
+    <div className="mb-3 flex items-center justify-between gap-3 rounded-[12px] border border-[rgba(9,184,62,0.22)] bg-primary-soft px-3 py-2.5 text-[12px] leading-5 text-primary">
+      <p className="min-w-0 flex-1 truncate">
+        已自动补全「{toast.itemTitle}」
+      </p>
+      <button
+        type="button"
+        className="shrink-0 rounded-full bg-[var(--admin-input-bg)] px-3 py-1 text-[12px] font-medium text-primary transition hover:bg-[var(--admin-input-hover-bg)] active:scale-[0.98]"
+        onClick={() => onUndo(toast.previousItems)}
+      >
+        撤销
+      </button>
+    </div>
+  );
 }
 
-function buildGroupConversationContext(
-  messages: TestMessage[],
-  identities: TestIdentity[]
+function AmbiguousArrangementUpdatePanel({
+  update,
+  onChoose,
+  onCreateNew,
+  onIgnore,
+}: {
+  update: AmbiguousArrangementUpdate | null;
+  onChoose: (arrangementId: string) => void;
+  onCreateNew: () => void;
+  onIgnore: () => void;
+}) {
+  if (!update) return null;
+
+  return (
+    <div className="rounded-[12px] border border-[rgba(9,184,62,0.22)] bg-primary-soft px-3 py-2.5 text-[12px] leading-5 text-text">
+      <p className="font-medium text-text">
+        {update.candidates.length > 1
+          ? "这条消息要更新哪一个事项？"
+          : `要更新“${update.candidates[0]?.arrangement.title ?? "这个事项"}”吗？`}
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {update.candidates.slice(0, 2).map((candidate) => (
+          <button
+            key={candidate.arrangement.id}
+            type="button"
+            className="rounded-full bg-primary px-3 py-1.5 text-[12px] font-medium text-on-primary transition active:scale-[0.98]"
+            onClick={() => onChoose(candidate.arrangement.id)}
+          >
+            更新“{candidate.arrangement.title}”
+          </button>
+        ))}
+        <button
+          type="button"
+          className="rounded-full bg-[var(--admin-input-bg)] px-3 py-1.5 text-[12px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)] active:scale-[0.98]"
+          onClick={onCreateNew}
+        >
+          新建安排
+        </button>
+        <button
+          type="button"
+          className="rounded-full bg-[var(--admin-input-bg)] px-3 py-1.5 text-[12px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)] active:scale-[0.98]"
+          onClick={onIgnore}
+        >
+          忽略
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AliasCandidateConfirmationCard({
+  confirmation,
+  onConfirm,
+  onIgnore,
+}: {
+  confirmation: AliasCandidateConfirmation;
+  onConfirm: (confirmation: AliasCandidateConfirmation) => void;
+  onIgnore: () => void;
+}) {
+  const [aliasText, setAliasText] = React.useState(confirmation.aliasText);
+  const [aliasMeaning, setAliasMeaning] = React.useState(
+    confirmation.aliasMeaning
+  );
+
+  React.useEffect(() => {
+    setAliasText(confirmation.aliasText);
+    setAliasMeaning(confirmation.aliasMeaning);
+  }, [confirmation]);
+
+  return (
+    <div className="rounded-[12px] border border-[rgba(9,184,62,0.22)] bg-primary-soft px-3 py-2 text-text">
+      <div className="flex items-start gap-2">
+        <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary text-[9px] font-semibold text-on-primary">
+          AI
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[13px] font-medium leading-5 text-text">
+            是否把“{confirmation.aliasText}”记为“{confirmation.aliasMeaning}”？
+          </p>
+          <div className="mt-2 grid gap-2 sm:grid-cols-2">
+            <input
+              value={aliasText}
+              onChange={(event) => setAliasText(event.target.value)}
+              placeholder="暗语"
+              className="h-9 rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[13px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+            />
+            <input
+              value={aliasMeaning}
+              onChange={(event) => setAliasMeaning(event.target.value)}
+              placeholder="暗语含义"
+              className="h-9 rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[13px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+            />
+          </div>
+        </div>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2 pl-7">
+        <button
+          type="button"
+          className="h-7 rounded-full bg-primary px-3 text-[12px] font-semibold text-on-primary transition hover:bg-primary-hover active:scale-[0.98]"
+          onClick={() =>
+            onConfirm({
+              ...confirmation,
+              aliasText: aliasText.trim(),
+              aliasMeaning: aliasMeaning.trim(),
+            })
+          }
+        >
+          写入暗语设置
+        </button>
+        <button
+          type="button"
+          className="h-7 rounded-full bg-[var(--admin-input-bg)] px-3 text-[12px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)] active:scale-[0.98]"
+          onClick={onIgnore}
+        >
+          忽略
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ChatArrangementConfirmationCard({
+  confirmation,
+  queueCount,
+  onConfirm,
+  onIgnore,
+}: {
+  confirmation: ChatArrangementConfirmation;
+  queueCount: number;
+  onConfirm: (confirmation: ChatArrangementConfirmation) => void;
+  onIgnore: (confirmationId: string) => void;
+}) {
+  const [isEditing, setIsEditing] = React.useState(false);
+  const [isDialogOpen, setIsDialogOpen] = React.useState(false);
+  const [draft, setDraft] = React.useState(confirmation);
+  const compactQuestion = buildArrangementConfirmationQuestion(confirmation);
+  const isUnknownAliasArrangement =
+    draft.sourceType === "unknown_alias_arrangement";
+  const possibleArrangementText = [draft.timeText, draft.title]
+    .filter(Boolean)
+    .join("");
+
+  React.useEffect(() => {
+    setDraft(confirmation);
+    setIsEditing(false);
+    setIsDialogOpen(false);
+  }, [confirmation]);
+
+  const updateDraft = (
+    key:
+      | "title"
+      | "timeText"
+      | "locationText"
+      | "note"
+      | "unknownAliasText"
+      | "suggestedAliasMeaning",
+    value: string
+  ) => {
+    setDraft((current) => ({
+      ...current,
+      [key]: value,
+      ...(key === "locationText" ? { locationName: value } : {}),
+    }));
+  };
+
+  const handleConfirm = () => {
+    const title = draft.title.trim();
+    if (!title) return;
+
+    onConfirm({
+      ...draft,
+      title,
+      timeText: draft.timeText.trim(),
+      locationText: draft.locationText.trim(),
+      locationName: draft.locationName.trim() || draft.locationText.trim(),
+      note: draft.note.trim(),
+      unknownAliasText: draft.unknownAliasText?.trim() ?? "",
+      suggestedAliasMeaning: draft.suggestedAliasMeaning?.trim() ?? "",
+      aliasLearningStatus: draft.suggestedAliasMeaning?.trim()
+        ? "suggested"
+        : draft.aliasLearningStatus,
+    });
+  };
+
+  const openConfirmDialog = () => {
+    setDraft(confirmation);
+    setIsDialogOpen(true);
+  };
+
+  return (
+    <>
+      <div className="rounded-[12px] border border-[rgba(9,184,62,0.22)] bg-primary-soft px-3 py-2 text-text">
+        {isEditing && !isUnknownAliasArrangement ? (
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-on-primary">
+              AI
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <p className="text-[13px] font-semibold leading-5 text-primary">
+                  编辑确认事项安排
+                </p>
+                {queueCount > 1 && (
+                  <span className="rounded-full bg-[rgba(9,184,62,0.12)] px-2 py-[2px] text-[10px] font-medium leading-3 text-primary">
+                    还有 {queueCount - 1} 个
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 space-y-2">
+                <input
+                  value={draft.title}
+                  onChange={(event) => updateDraft("title", event.target.value)}
+                  placeholder="安排标题"
+                  className="h-9 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[13px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+                />
+                <input
+                  value={draft.timeText}
+                  onChange={(event) => updateDraft("timeText", event.target.value)}
+                  placeholder="时间"
+                  className="h-9 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[13px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+                />
+                <input
+                  value={draft.locationName || draft.locationText}
+                  onChange={(event) =>
+                    updateDraft("locationText", event.target.value)
+                  }
+                  placeholder="地点"
+                  className="h-9 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[13px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+                />
+                <textarea
+                  value={draft.note}
+                  onChange={(event) => updateDraft("note", event.target.value)}
+                  placeholder="备注"
+                  rows={2}
+                  className="min-h-[58px] w-full resize-none rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 py-2 text-[13px] leading-5 text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+                />
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div>
+            <div className="flex min-w-0 items-start gap-2">
+              <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary text-[9px] font-semibold text-on-primary">
+                AI
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-[13px] font-medium leading-5 text-text">
+                  {isUnknownAliasArrangement
+                    ? `检测到可能的安排：${
+                        possibleArrangementText || draft.title || "这个事项"
+                      }`
+                    : compactQuestion}
+                </p>
+                {queueCount > 1 && (
+                  <p className="mt-0.5 truncate text-[11px] leading-4 text-text-tertiary">
+                    还有 {queueCount - 1} 个待确认
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-2 flex flex-wrap items-center gap-2 pl-7">
+            <button
+              type="button"
+              className="h-7 rounded-full bg-primary px-3 text-[12px] font-semibold text-on-primary transition hover:bg-primary-hover active:scale-[0.98]"
+              onClick={isUnknownAliasArrangement ? openConfirmDialog : handleConfirm}
+            >
+              {isEditing ? "保存并添加" : "确认添加"}
+            </button>
+            <button
+              type="button"
+              className="h-7 rounded-full bg-[var(--admin-input-bg)] px-3 text-[12px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)] active:scale-[0.98]"
+              onClick={() => {
+                if (isEditing) {
+                  setDraft(confirmation);
+                  setIsEditing(false);
+                  return;
+                }
+                if (isUnknownAliasArrangement) {
+                  openConfirmDialog();
+                  return;
+                }
+                setIsEditing(true);
+              }}
+            >
+              {isEditing ? "取消" : "编辑"}
+            </button>
+            <button
+              type="button"
+              className="h-7 rounded-full bg-[var(--admin-input-bg)] px-3 text-[12px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)] active:scale-[0.98]"
+              onClick={() => onIgnore(confirmation.id)}
+            >
+              忽略
+            </button>
+        </div>
+      </div>
+
+      {isUnknownAliasArrangement && isDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-end justify-center bg-[rgba(15,23,42,0.32)] px-4 pb-4 pt-12 backdrop-blur-[2px]">
+          <div className="w-full max-w-[430px] rounded-[18px] bg-[var(--admin-panel-bg)] p-4 text-text shadow-[0_20px_60px_rgba(15,23,42,0.24)]">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[16px] font-semibold leading-6 text-text">
+                  确认暗语与安排
+                </p>
+                <p className="mt-1 text-[12px] leading-5 text-text-tertiary">
+                  {`检测到可能的安排：${
+                    possibleArrangementText || draft.title || "这个事项"
+                  }`}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="h-7 rounded-full bg-[var(--admin-input-bg)] px-3 text-[12px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)]"
+                onClick={() => {
+                  setDraft(confirmation);
+                  setIsDialogOpen(false);
+                }}
+              >
+                关闭
+              </button>
+            </div>
+
+            <div className="mt-3 space-y-2">
+              <input
+                value={draft.title}
+                onChange={(event) => updateDraft("title", event.target.value)}
+                placeholder="安排标题"
+                className="h-10 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[14px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+              />
+              <input
+                value={draft.timeText}
+                onChange={(event) => updateDraft("timeText", event.target.value)}
+                placeholder="时间"
+                className="h-10 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[14px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+              />
+              <input
+                value={draft.locationName || draft.locationText}
+                onChange={(event) => updateDraft("locationText", event.target.value)}
+                placeholder="地点"
+                className="h-10 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[14px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+              />
+              <textarea
+                value={draft.note}
+                onChange={(event) => updateDraft("note", event.target.value)}
+                placeholder="备注"
+                rows={2}
+                className="min-h-[62px] w-full resize-none rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 py-2 text-[14px] leading-5 text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+              />
+              <label className="block text-[12px] leading-4 text-text-tertiary">
+                暗语
+                <input
+                  value={draft.unknownAliasText ?? ""}
+                  onChange={(event) =>
+                    updateDraft("unknownAliasText", event.target.value)
+                  }
+                  placeholder="例如：~~、老样子"
+                  className="mt-1 h-10 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[14px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+                />
+              </label>
+              <label className="block text-[12px] leading-4 text-text-tertiary">
+                暗语含义
+                <input
+                  value={draft.suggestedAliasMeaning ?? ""}
+                  onChange={(event) =>
+                    updateDraft("suggestedAliasMeaning", event.target.value)
+                  }
+                  placeholder="可编辑暗语含义，如：游泳"
+                  className="mt-1 h-10 w-full rounded-[10px] border border-[rgba(9,184,62,0.22)] bg-[var(--admin-input-bg)] px-3 text-[14px] text-text outline-none focus:border-primary focus:[box-shadow:var(--admin-input-focus-shadow)]"
+                />
+              </label>
+            </div>
+
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                className="h-9 rounded-full bg-[var(--admin-input-bg)] px-4 text-[13px] font-medium text-text-muted transition hover:bg-[var(--admin-input-hover-bg)]"
+                onClick={() => onIgnore(confirmation.id)}
+              >
+                忽略
+              </button>
+              <button
+                type="button"
+                className="h-9 rounded-full bg-primary px-4 text-[13px] font-semibold text-on-primary transition hover:bg-primary-hover active:scale-[0.98]"
+                onClick={handleConfirm}
+              >
+                确认添加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function buildArrangementConfirmationQuestion(
+  confirmation: ChatArrangementConfirmation
 ) {
-  return messages
-    .sort((a, b) => a.sentAt - b.sentAt)
-    .map((message) => {
-      const speaker =
-        message.sender === "demo"
-          ? "我"
-          : identities.find((identity) => identity.id === message.identityId)
-              ?.name ?? "群成员";
-      return `${speaker}：${message.text}`;
-    })
-    .join("\n");
+  const title = confirmation.title.trim();
+  const timeText = confirmation.timeText.trim();
+  const location = (
+    confirmation.locationName.trim() || confirmation.locationText.trim()
+  ).trim();
+  const locationText = location && !title.includes(location) ? `（${location}）` : "";
+  const mainText = [timeText, title].filter(Boolean).join("");
+
+  return `要帮您安排${mainText || title || "这个事项"}${locationText}吗？`;
 }
 
 function AutoRecognitionStatusPanel({ status }: { status: AutoRecognitionStatus }) {
@@ -1010,7 +2686,7 @@ function AutoRecognitionStatusPanel({ status }: { status: AutoRecognitionStatus 
   const isError = status.status === "error";
   const isSuccess = status.status === "success";
   const message =
-    status.status === "loading" ? "正在自动识别私聊里的安排..." : status.message;
+    status.status === "loading" ? "正在自动识别聊天里的安排..." : status.message;
 
   return (
     <div

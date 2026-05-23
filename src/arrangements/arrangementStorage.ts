@@ -18,6 +18,13 @@ export type ArrangementItem = {
   createdAt: number;
   pinned: boolean;
   contexts?: string[];
+  sourceConversationId?: string;
+  sourceConversationType?: "private" | "group";
+  sourceMessageIds?: string[];
+  sourceType?: "unknown_alias_arrangement";
+  unknownAliasText?: string;
+  suggestedAliasMeaning?: string;
+  aliasLearningStatus?: "suggested" | "confirmed";
 };
 
 export type ArrangementDraft = {
@@ -38,6 +45,13 @@ export type PendingArrangementDraft = ArrangementDraft & {
   confidence: number;
   contexts: string[];
   source: "ai" | "rules" | "ai_group_chat";
+  sourceConversationId?: string;
+  sourceConversationType?: "private" | "group";
+  sourceMessageIds?: string[];
+  sourceType?: "unknown_alias_arrangement";
+  unknownAliasText?: string;
+  suggestedAliasMeaning?: string;
+  aliasLearningStatus?: "suggested" | "confirmed";
   createdAt: number;
 };
 
@@ -168,6 +182,7 @@ function normalizeStoredArrangement(value: unknown): ArrangementItem | null {
   const startTime = normalizeText(item.startTime);
   const endTime = normalizeText(item.endTime);
   const contexts = normalizeContexts(item.contexts);
+  const sourceMessageIds = normalizeContexts(item.sourceMessageIds);
 
   return {
     id,
@@ -189,6 +204,21 @@ function normalizeStoredArrangement(value: unknown): ArrangementItem | null {
         : Date.now(),
     pinned: item.pinned === true,
     ...(contexts.length > 0 ? { contexts } : {}),
+    sourceConversationId: normalizeText(item.sourceConversationId),
+    sourceConversationType:
+      item.sourceConversationType === "group" ? "group" : "private",
+    ...(sourceMessageIds.length > 0 ? { sourceMessageIds } : {}),
+    sourceType:
+      item.sourceType === "unknown_alias_arrangement"
+        ? item.sourceType
+        : undefined,
+    unknownAliasText: normalizeText(item.unknownAliasText),
+    suggestedAliasMeaning: normalizeText(item.suggestedAliasMeaning),
+    aliasLearningStatus:
+      item.aliasLearningStatus === "confirmed" ||
+      item.aliasLearningStatus === "suggested"
+        ? item.aliasLearningStatus
+        : undefined,
   };
 }
 
@@ -260,6 +290,21 @@ function normalizePendingArrangementDraft(value: unknown): PendingArrangementDra
       draft.source === "rules" || draft.source === "ai_group_chat"
         ? draft.source
         : "ai",
+    sourceConversationId: normalizeText(draft.sourceConversationId),
+    sourceConversationType:
+      draft.sourceConversationType === "group" ? "group" : "private",
+    sourceMessageIds: normalizeContexts(draft.sourceMessageIds),
+    sourceType:
+      draft.sourceType === "unknown_alias_arrangement"
+        ? draft.sourceType
+        : undefined,
+    unknownAliasText: normalizeText(draft.unknownAliasText),
+    suggestedAliasMeaning: normalizeText(draft.suggestedAliasMeaning),
+    aliasLearningStatus:
+      draft.aliasLearningStatus === "confirmed" ||
+      draft.aliasLearningStatus === "suggested"
+        ? draft.aliasLearningStatus
+        : undefined,
     createdAt:
       typeof draft.createdAt === "number" && Number.isFinite(draft.createdAt)
         ? draft.createdAt
